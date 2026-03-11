@@ -1,1364 +1,4045 @@
-// EMBY-PROXY-UI V17.6 (Optimized)
-// [V17.6]  Web 端备用模式有效期延长至 24小时。状态码修正: 节点不存在时返回 404 (原 403)
-// [V17.5] 静态资源CacheKey归一化(去Token/去随机参)，强制移除图片Range头以最大化缓存命中率，缓存命中率: 针对静态图片 强制移除 Range 头，避免 Cloudflare 缓存碎片化。
-// [V17.4] ...修复部分环境下 KV 绑定变量名不兼容问题
+// EMBY-PROXY-UI V18.0 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
+// 终极修复：彻底解决 POST 导致 WAF/Emby 报错，拔除所有视频节流冗余代码，无损 URL 穿透
+// 补丁集成：Emby 授权头双向兼容、登录 API 补头、轻量 403 重试、协议 Fallback
+// 数据面板升级：支持 Cloudflare Analytics 聚合、时间锥、以及全场景“资源类别”徽章解析
+//
+// 单文件导航图（保持单文件部署，不做物理解耦）：
+// 0. 全局状态与通用工具
+// 1. Auth：管理员认证与 JWT
+// 2. CacheManager / Database：配置、节点、状态、管理 API
+// 3. Proxy：代理主链路、重试、响应整形
+// 4. Logger：日志写入与运行状态回写
+// 5. UI_HTML：控制台界面与前端逻辑
+// 6. Runtime Entry：fetch / scheduled 入口
+//
+// 单文件内部边界词典（阅读前先统一术语）：
+// - source of truth：当前语义下的唯一真相源；配置以 KV/runtime config 为准，节点以 KV + nodes index 为准。
+// - cache：为减轻读取成本设置的内存或 KV 快照，不应反向定义业务真相。
+// - fallback：主口径/主路径失败后的兜底路径；允许降级，但要显式标出来源变化。
+// - direct：请求不再由 Worker 中继数据体，而是直接下发目标地址给客户端。
+// - proxy：请求继续由 Worker 拉取上游并转发响应，是默认的透明中继路径。
+// - retry：同一请求语义下的再次尝试；这里只允许在明确安全的条件下发生，避免破坏非幂等请求。
+// - runtime status：写入 `sys:ops_status:v1` 的运行状态面板数据，用于“可解释观测”，不是强审计日志。
+// - smoke：高频快速验收回归，只覆盖核心链路；full：包含 smoke + 扩展运维状态验证。
+// - thin dispatcher：只做解析、归一、派发，不承载业务复杂度的入口层，例如 `handleApi`。
 
 // ============================================================================
-// 0. GLOBAL CONFIG & STATE 
+// 0. 全局配置与状态 (GLOBAL CONFIG & STATE)
 // ============================================================================
-const GLOBALS = {
-    NodeCache: new Map(),
-    ConfigCache: null, 
-    Regex: {
-        // [原有] 文件后缀匹配
-        StaticExt: /\.(?:jpg|jpeg|gif|png|svg|ico|webp|js|css|woff2?|ttf|otf|map|webmanifest|json|srt|ass|vtt|sub)$/i,
-        // [新增] Emby/Jellyfin 特有的 API 静态资源路径 (核心改进)
-        EmbyImages: /(?:\/Images\/|\/Icons\/|\/Branding\/|\/emby\/covers\/)/i,
-        // [原有] 流媒体后缀
-        Streaming: /\.(?:mp4|m4v|m4s|m4a|ogv|webm|mkv|mov|avi|wmv|flv|ts|m3u8|mpd)$/i
-    },
-    isDaytimeCN: () => {
-        const h = (new Date().getUTCHours() + 8) % 24;
-        return h >= 6 && h < 18;
-    }
-};
-
 const Config = {
-    Defaults: {
-        JwtExpiry: 60 * 60 * 24 * 7,
-        LoginLockDuration: 900,
-        MaxLoginAttempts: 5,
-        CacheTTL: 60000
-    }
+  Defaults: {
+    JwtExpiry: 60 * 60 * 24 * 30,  
+    LoginLockDuration: 900,         
+    MaxLoginAttempts: 5,            
+    CacheTTL: 60000,                
+    CryptoKeyCacheTTL: 86400,       
+    CryptoKeyCacheMax: 100,         
+    NodeCacheMax: 5000,             
+    NodesReadConcurrency: 12,       
+    LogFlushDelayMinutes: 20,
+    LogFlushCountThreshold: 50,
+    LogBatchChunkSize: 50,
+    CleanupBudgetMs: 1,             
+    CleanupChunkSize: 64,           
+    AssetHash: "v18.0",           
+    Version: "18.0"                 
+  }
 };
 
+const GLOBALS = {
+  NodeCache: new Map(),
+  ConfigCache: null,
+  CryptoKeyCache: new Map(),
+  NodesListCache: null,
+  CleanupState: { phase: 0 },
+  NodesIndexCache: null,
+  LogQueue: [],
+  LogDedupe: new Map(),
+  RateLimitCache: new Map(),
+  LogFlushPending: false,
+  LogLastFlushAt: 0,
+  Regex: {
+    StaticExt: /\.(?:jpg|jpeg|gif|png|svg|ico|webp|js|css|woff2?|ttf|otf|map|webmanifest|json)$/i,
+    SubtitleExt: /\.(?:srt|ass|vtt|sub)$/i,
+    EmbyImages: /(?:\/Images\/|\/Icons\/|\/Branding\/|\/emby\/covers\/)/i,
+    ManifestExt: /\.(?:m3u8|mpd)$/i,
+    SegmentExt: /\.(?:ts|m4s)$/i,
+    Streaming: /\.(?:mp4|m4v|m4a|ogv|webm|mkv|mov|avi|wmv|flv)$/i
+  },
+  SecurityHeaders: {
+    "Referrer-Policy": "origin-when-cross-origin",
+    "Strict-Transport-Security": "max-age=15552000; preload",
+    "X-Frame-Options": "SAMEORIGIN",
+    "X-Content-Type-Options": "nosniff",
+    "X-XSS-Protection": "1; mode=block"
+  },
+  DropRequestHeaders: new Set([
+    "host", "x-real-ip", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded",
+    "connection", "upgrade", "transfer-encoding", "te", "keep-alive",
+    "proxy-authorization", "proxy-authenticate", "trailer", "expect"
+  ]),
+  DropResponseHeaders: new Set([
+    "access-control-allow-origin", "access-control-allow-methods", "access-control-allow-headers", "access-control-allow-credentials",
+    "x-frame-options", "strict-transport-security", "x-content-type-options", "x-xss-protection", "referrer-policy",
+    "x-powered-by", "server" 
+  ])
+};
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Emby-Authorization, X-Emby-Token, X-Emby-Client, X-Emby-Device-Id, X-Emby-Device-Name, X-Emby-Client-Version"
+};
+
+function mergeVaryHeader(headers, value) {
+  const current = headers.get("Vary");
+  if (!current) {
+    headers.set("Vary", value);
+    return;
+  }
+  const parts = current.split(",").map(v => v.trim()).filter(Boolean);
+  if (!parts.includes(value)) parts.push(value);
+  headers.set("Vary", parts.join(", "));
+}
+
+function applySecurityHeaders(headers) {
+  Object.entries(GLOBALS.SecurityHeaders).forEach(([k, v]) => headers.set(k, v));
+  return headers;
+}
+
+function formatBytes(bytes) {
+  if (!bytes || bytes === 0) return '0 B';
+  const k = 1024, sizes = ['B', 'KB', 'MB', 'GB', 'TB'], i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function toGraphQLString(value) {
+  return JSON.stringify(String(value ?? ""));
+}
+
+function toGraphQLStringArray(values) {
+  return JSON.stringify((Array.isArray(values) ? values : []).map(value => String(value ?? "")));
+}
+
+function getCorsHeadersForResponse(env, request, originOverride = null) {
+  const reqOrigin = request.headers.get("Origin");
+  const reqHeaders = request.headers.get("Access-Control-Request-Headers") || corsHeaders["Access-Control-Allow-Headers"];
+  const allowOrigin = originOverride || reqOrigin || corsHeaders["Access-Control-Allow-Origin"];
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": corsHeaders["Access-Control-Allow-Methods"],
+    "Access-Control-Allow-Headers": reqHeaders,
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, X-Emby-Auth-Token",
+    "Access-Control-Max-Age": "86400"
+  };
+}
+
+function safeDecodeSegment(segment = "") {
+  if (!segment) return "";
+  try { return decodeURIComponent(segment); } catch { return segment; }
+}
+
+function sanitizeProxyPath(path) {
+  let raw = typeof path === "string" ? path : "/";
+  if (!raw) return "/";
+  if (!raw.startsWith("/")) raw = "/" + raw;
+  raw = raw.replace(/^\/+/, "/");
+  return raw;
+}
+
+function buildProxyPrefix(name, key) {
+  const encodedName = encodeURIComponent(String(name || ""));
+  if (!key) return "/" + encodedName;
+  return "/" + encodedName + "/" + encodeURIComponent(String(key));
+}
+
+const DEFAULT_WANGPAN_DIRECT_TERMS = [
+  "115.com", "anxia.com", "jianguoyun", "aliyundrive", "alipan", "aliyundrive.net", "alicloudccp", "myqcloud", "aliyuncs",
+  "189.cn", "ctyun.cn", "baidu", "baidupcs", "123pan", "qiniudn", "qbox.me", "myhuaweicloud", "139.com",
+  "quark", "yun.uc.cn", "r2.cloudflarestorage", "volces.com", "tos-s3"
+];
+const DEFAULT_WANGPAN_DIRECT_TEXT = DEFAULT_WANGPAN_DIRECT_TERMS.join(",");
+
+function escapeRegexLiteral(value = "") {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseKeywordTerms(raw = "") {
+  return String(raw || "")
+    .split(/[\n\r,，;；|]+/)
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+function buildKeywordFuzzyRegex(raw = "", fallbackTerms = []) {
+  const baseTerms = parseKeywordTerms(raw);
+  const fallbackList = Array.isArray(fallbackTerms) ? fallbackTerms : parseKeywordTerms(String(fallbackTerms || ""));
+  const mergedTerms = baseTerms.length ? baseTerms : fallbackList;
+  if (!mergedTerms.length) return null;
+  try {
+    return new RegExp(mergedTerms.map(escapeRegexLiteral).join("|"), "i");
+  } catch {
+    return null;
+  }
+}
+
+function getWangpanDirectText(raw = "") {
+  const terms = parseKeywordTerms(raw);
+  return (terms.length ? terms : DEFAULT_WANGPAN_DIRECT_TERMS).join(",");
+}
+
+function shouldDirectByWangpan(targetUrl, customKeywords = "") {
+  let haystack = "";
+  try {
+    const url = targetUrl instanceof URL ? targetUrl : new URL(String(targetUrl));
+    haystack = `${url.hostname} ${url.href}`;
+  } catch {
+    haystack = String(targetUrl || "");
+  }
+  const matchRegex = buildKeywordFuzzyRegex(customKeywords, DEFAULT_WANGPAN_DIRECT_TERMS);
+  return !!matchRegex && matchRegex.test(haystack);
+}
+
+function normalizeNodeNameList(input) {
+  const rawList = Array.isArray(input)
+    ? input
+    : String(input || "").split(/[\\r\\n,，;；|]+/);
+  const seen = new Set();
+  const result = [];
+  for (const item of rawList) {
+    const value = String(item || "").trim();
+    if (!value) continue;
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+
+function isNodeDirectSourceEnabled(node, currentConfig = null) {
+  const configuredDirectNodes = normalizeNodeNameList(currentConfig?.sourceDirectNodes ?? currentConfig?.directSourceNodes ?? currentConfig?.nodeDirectList ?? []);
+  const nodeName = String(node?.name || "").trim();
+  if (nodeName && configuredDirectNodes.some(item => item.toLowerCase() === nodeName.toLowerCase())) return true;
+  const proxyMode = String(node?.proxyMode || node?.mode || "").trim().toLowerCase();
+  if (["direct", "source-direct", "origin-direct", "node-direct"].includes(proxyMode)) return true;
+  if (node?.direct === true || node?.sourceDirect === true || node?.directSource === true || node?.direct2xx === true) return true;
+  const explicitText = `${node?.tag || ""} ${node?.remark || ""}`;
+  return /(?:^|[\s\[(【])(?:直连|source-direct|origin-direct|node-direct)(?:$|[\s\])】])/i.test(explicitText);
+}
+
+function resolveRedirectTarget(location, baseUrl) {
+  if (!location) return null;
+  try {
+    return new URL(location, baseUrl instanceof URL ? baseUrl : String(baseUrl || ""));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeRedirectMethod(status, method = "GET") {
+  const upperMethod = String(method || "GET").toUpperCase();
+  if (status === 303 && upperMethod !== "GET" && upperMethod !== "HEAD") return "GET";
+  if ((status === 301 || status === 302) && upperMethod === "POST") return "GET";
+  return upperMethod;
+}
+
+const CF_DASH_CACHE_VERSION = 4;
+
+function makeCfDashCacheKey(zoneId, dateKey = "") {
+  const safeZoneId = encodeURIComponent(String(zoneId || "default").trim() || "default");
+  const safeDateKey = encodeURIComponent(String(dateKey || "current").trim() || "current");
+  return `sys:cf_dash_cache:${safeZoneId}:${safeDateKey}`;
+}
+
+function getVideoRequestWhereClause(column = "request_path") {
+  return `(${column} LIKE '%/stream%' OR ${column} LIKE '%/master.m3u8%' OR ${column} LIKE '%/videos/%/original%' OR ${column} LIKE '%/videos/%/download%' OR ${column} LIKE '%/videos/%/file%' OR ${column} LIKE '%/items/%/download%' OR ${column} LIKE '%Static=true%' OR ${column} LIKE '%Download=true%')`;
+}
+
+function parseHostnameCandidate(rawHostname) {
+  const host = String(rawHostname || "").trim().toLowerCase();
+  if (!host) return null;
+  const wildcard = host.includes("*");
+  const cleaned = host.replace(/^\*\./, "").replace(/^\*+/, "").replace(/\*+$/g, "").replace(/^\.+|\.+$/g, "");
+  if (!cleaned) return null;
+  return { hostname: cleaned, wildcard };
+}
+
+function extractRouteHostnameInfo(pattern) {
+  const rawPattern = String(pattern || "").trim();
+  if (!rawPattern) return null;
+  const slashIndex = rawPattern.indexOf("/");
+  const rawHost = slashIndex === -1 ? rawPattern : rawPattern.slice(0, slashIndex);
+  const path = slashIndex === -1 ? "" : rawPattern.slice(slashIndex);
+  const parsed = parseHostnameCandidate(rawHost);
+  if (!parsed) return null;
+  return { ...parsed, path, pattern: rawPattern };
+}
+
+function scoreHostnameCandidate(hostname, options = {}) {
+  const path = String(options.path || "");
+  let score = 0;
+  if (!options.wildcard) score += 100;
+  if (hostname.includes(".workers.dev")) score -= 20;
+  if (path === "/" || path === "/*") score += 20;
+  else if (path.endsWith("*")) score += 10;
+  else if (path) score += 4;
+  score += hostname.split(".").length * 4;
+  score -= Math.min(path.length, 30);
+  return score;
+}
+
+async function fetchCloudflareApiJson(url, apiToken) {
+  const res = await fetch(url, {
+    headers: { "Authorization": `Bearer ${apiToken}`, "Content-Type": "application/json" }
+  });
+  if (!res.ok) throw new Error(`cf_api_http_${res.status}`);
+  const payload = await res.json();
+  if (payload?.success === false) {
+    const msg = Array.isArray(payload?.errors) ? payload.errors.map(item => item?.message).filter(Boolean).join("; ") : "";
+    throw new Error(msg || "cf_api_error");
+  }
+  return payload;
+}
+
+async function fetchCloudflareGraphQL(apiToken, query, variables) {
+  const body = variables && typeof variables === "object"
+    ? { query, variables }
+    : { query };
+  const cfRes = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${apiToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!cfRes.ok) throw new Error(`cf_graphql_http_${cfRes.status}`);
+  const cfData = await cfRes.json();
+  if (Array.isArray(cfData?.errors) && cfData.errors.length) {
+    throw new Error(cfData.errors.map(item => item?.message).filter(Boolean).join("; ") || "cf_graphql_error");
+  }
+  return cfData;
+}
+
+async function fetchCloudflareGraphQLZone(zoneId, apiToken, query, variables) {
+  const cfData = await fetchCloudflareGraphQL(apiToken, query, variables);
+  return cfData?.data?.viewer?.zones?.[0] || null;
+}
+
+async function fetchCloudflareGraphQLAccount(accountId, apiToken, query, variables) {
+  const cfData = await fetchCloudflareGraphQL(apiToken, query, variables);
+  return cfData?.data?.viewer?.accounts?.[0] || null;
+}
+
+async function fetchCloudflareZoneDetails(zoneId, apiToken) {
+  if (!zoneId || !apiToken) return null;
+  const payload = await fetchCloudflareApiJson(`https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(String(zoneId).trim())}`, apiToken);
+  return payload?.result || null;
+}
+
+async function resolveCloudflareWorkerServices({ cfAccountId, cfZoneId, cfApiToken }) {
+  const serviceNames = new Set();
+  const pushName = (rawName) => {
+    const name = String(rawName || "").trim();
+    if (!name) return;
+    serviceNames.add(name);
+  };
+
+  if (cfAccountId && cfZoneId) {
+    try {
+      const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(String(cfAccountId).trim())}/workers/domains?zone_id=${encodeURIComponent(String(cfZoneId).trim())}`;
+      const payload = await fetchCloudflareApiJson(url, cfApiToken);
+      for (const item of payload?.result || []) {
+        pushName(item?.service || item?.script || item?.name);
+      }
+    } catch (e) {
+      console.log("CF Workers domains service lookup failed", e);
+    }
+  }
+
+  if (cfZoneId) {
+    try {
+      let page = 1;
+      let totalPages = 1;
+      do {
+        const url = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(String(cfZoneId).trim())}/workers/routes?page=${page}&per_page=100`;
+        const payload = await fetchCloudflareApiJson(url, cfApiToken);
+        totalPages = Number(payload?.result_info?.total_pages || payload?.result_info?.totalPages || 1);
+        for (const item of payload?.result || []) {
+          pushName(item?.script || item?.service);
+        }
+        page += 1;
+      } while (page <= totalPages && page <= 5);
+    } catch (e) {
+      console.log("CF Workers routes service lookup failed", e);
+    }
+  }
+
+  return [...serviceNames];
+}
+
+async function fetchCloudflareWorkerUsageMetrics({ cfAccountId, cfZoneId, cfApiToken, startIso, endIso }) {
+  if (!cfAccountId || !cfApiToken) return null;
+  const serviceNames = await resolveCloudflareWorkerServices({ cfAccountId, cfZoneId, cfApiToken });
+  if (!serviceNames.length) return null;
+
+  const query = `
+  query {
+    viewer {
+      accounts(filter: { accountTag: ${toGraphQLString(cfAccountId)} }) {
+        workersInvocationsAdaptive(limit: 10000, filter: { datetime_geq: ${toGraphQLString(startIso)}, datetime_leq: ${toGraphQLString(endIso)}, scriptName_in: ${toGraphQLStringArray(serviceNames)} }) {
+          dimensions { datetime scriptName status }
+          sum { requests }
+        }
+      }
+    }
+  }`;
+
+  const accountData = await fetchCloudflareGraphQLAccount(cfAccountId, cfApiToken, query);
+  const records = Array.isArray(accountData?.workersInvocationsAdaptive) ? accountData.workersInvocationsAdaptive : [];
+  const hourlySeries = Array.from({ length: 24 }, (_, hour) => ({ label: String(hour).padStart(2, "0") + ":00", total: 0 }));
+
+  let totalRequests = 0;
+  for (const item of records) {
+    const req = Number(item?.sum?.requests) || 0;
+    totalRequests += req;
+
+    const dtRaw = item?.dimensions?.datetime;
+    if (!dtRaw) continue;
+    const dt = new Date(dtRaw);
+    if (Number.isNaN(dt.getTime())) continue;
+    const hour = (dt.getUTCHours() + 8) % 24;
+    if (hourlySeries[hour]) hourlySeries[hour].total += req;
+  }
+
+  return { totalRequests, hourlySeries, serviceNames };
+}
+
+async function resolveCloudflareBoundHostname({ cfAccountId, cfZoneId, cfApiToken, zoneNameFallback = "" }) {
+  const candidates = [];
+  const pushCandidate = (rawHostname, options = {}) => {
+    const parsed = parseHostnameCandidate(rawHostname);
+    if (!parsed) return;
+    const wildcard = options.wildcard === true || parsed.wildcard === true;
+    candidates.push({
+      hostname: parsed.hostname,
+      path: String(options.path || ""),
+      wildcard,
+      score: scoreHostnameCandidate(parsed.hostname, { wildcard, path: options.path || "" })
+    });
+  };
+
+  if (cfAccountId && cfZoneId) {
+    try {
+      const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(String(cfAccountId).trim())}/workers/domains?zone_id=${encodeURIComponent(String(cfZoneId).trim())}`;
+      const payload = await fetchCloudflareApiJson(url, cfApiToken);
+      for (const item of payload?.result || []) {
+        pushCandidate(item?.hostname);
+      }
+    } catch (e) {
+      console.log("CF Workers domains lookup failed, will try routes", e);
+    }
+  }
+
+  if (!candidates.length && cfZoneId) {
+    try {
+      let page = 1;
+      let totalPages = 1;
+      do {
+        const url = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(String(cfZoneId).trim())}/workers/routes?page=${page}&per_page=100`;
+        const payload = await fetchCloudflareApiJson(url, cfApiToken);
+        totalPages = Number(payload?.result_info?.total_pages || payload?.result_info?.totalPages || 1);
+        for (const item of payload?.result || []) {
+          const info = extractRouteHostnameInfo(item?.pattern);
+          if (!info) continue;
+          pushCandidate(info.hostname, { wildcard: info.wildcard, path: info.path });
+        }
+        page += 1;
+      } while (page <= totalPages && page <= 5);
+    } catch (e) {
+      console.log("CF Workers routes lookup failed", e);
+    }
+  }
+
+  if (candidates.length) {
+    candidates.sort((a, b) => (b.score - a.score) || (a.hostname.length - b.hostname.length) || a.hostname.localeCompare(b.hostname));
+    return candidates[0].hostname;
+  }
+
+  return zoneNameFallback || "未知域名 (请配置 CF 联动)";
+}
+
+function sanitizeRuntimeConfig(input = {}) {
+  const config = input && typeof input === "object" ? { ...input } : {};
+  const trimFields = ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect"];
+  for (const key of trimFields) {
+    if (config[key] === undefined || config[key] === null) continue;
+    config[key] = String(config[key]).trim();
+  }
+  if (Array.isArray(config.sourceDirectNodes)) config.sourceDirectNodes = normalizeNodeNameList(config.sourceDirectNodes);
+  const logDelayMinutes = Number(config.logWriteDelayMinutes);
+  config.logWriteDelayMinutes = Number.isFinite(logDelayMinutes) ? Math.max(0, logDelayMinutes) : Config.Defaults.LogFlushDelayMinutes;
+  const logFlushCountThreshold = Number(config.logFlushCountThreshold);
+  config.logFlushCountThreshold = Number.isFinite(logFlushCountThreshold) ? Math.max(1, Math.floor(logFlushCountThreshold)) : Config.Defaults.LogFlushCountThreshold;
+  return config;
+}
+
+function classifyCloudflareAnalyticsError(message, options = {}) {
+  const raw = String(message || "").trim();
+  const lower = raw.toLowerCase();
+  const zoneId = String(options.zoneId || "").trim();
+  const result = {
+    status: "CF 查询失败",
+    hint: "Cloudflare 查询失败，请检查 Zone ID、API 令牌与资源范围",
+    detail: raw || (zoneId ? `当前查询的 Zone ID: ${zoneId}` : "")
+  };
+  if (!raw) return result;
+  if (lower.includes("unknown field") || lower.includes("unknown enum") || lower.includes("error parsing args")) {
+    return {
+      status: "Schema 不兼容",
+      hint: "当前账号可用的 GraphQL schema 与脚本查询字段不一致",
+      detail: raw
+    };
+  }
+  if (lower.includes("cf_graphql_http_429") || lower.includes("rate limit") || lower.includes("too many requests")) {
+    return {
+      status: "请求过于频繁",
+      hint: "Cloudflare GraphQL 已限流，请稍后再试",
+      detail: raw
+    };
+  }
+  if (lower.includes("invalid token") || lower.includes("authentication") || lower.includes("cf_graphql_http_401")) {
+    return {
+      status: "令牌无效",
+      hint: "Cloudflare API 令牌无效，或未启用 GraphQL Analytics 访问",
+      detail: raw
+    };
+  }
+  if (lower.includes("not authorized") || lower.includes("permission") || lower.includes("forbidden") || lower.includes("unauthorized") || lower.includes("cf_graphql_http_403")) {
+    return {
+      status: "权限或范围不匹配",
+      hint: "令牌权限不足，或 Account / Zone Resources 未覆盖当前查询",
+      detail: raw + (zoneId ? ` | Zone ID: ${zoneId}` : "")
+    };
+  }
+  if (lower.includes("zone") && (lower.includes("not found") || lower.includes("invalid") || lower.includes("unknown"))) {
+    return {
+      status: "Zone ID 无效",
+      hint: "Zone ID 无效，或当前令牌无法访问这个 Zone",
+      detail: raw + (zoneId ? ` | Zone ID: ${zoneId}` : "")
+    };
+  }
+  if (lower.includes("cf_graphql_http_400")) {
+    return {
+      status: "请求参数无效",
+      hint: "GraphQL 请求参数无效，请检查 Zone ID 与筛选条件",
+      detail: raw + (zoneId ? ` | Zone ID: ${zoneId}` : "")
+    };
+  }
+  return result;
+}
+
+async function getRuntimeConfig(env) {
+  const kv = Auth.getKV(env);
+  if (!kv) return {};
+  const now = nowMs();
+  const cacheNamespace = String(
+    env?.__CONFIG_CACHE_NAMESPACE
+    || env?.__WORKER_CACHE_SCOPE
+    || (env?.ENI_KV ? "ENI_KV" : "")
+    || (env?.KV ? "KV" : "")
+    || (env?.EMBY_KV ? "EMBY_KV" : "")
+    || (env?.EMBY_PROXY ? "EMBY_PROXY" : "")
+    || "default"
+  );
+  if (GLOBALS.ConfigCache && GLOBALS.ConfigCache.exp > now && GLOBALS.ConfigCache.data && GLOBALS.ConfigCache.namespace === cacheNamespace) return GLOBALS.ConfigCache.data;
+  let config = {};
+  try { config = sanitizeRuntimeConfig(await kv.get(Database.CONFIG_KEY, { type: "json" }) || {}); } catch {}
+  GLOBALS.ConfigCache = { data: config, exp: now + 60000, namespace: cacheNamespace };
+  return config;
+}
+
+function parseCookieHeader(cookieHeader) {
+  const map = new Map();
+  if (!cookieHeader || typeof cookieHeader !== "string") return map;
+  for (const rawPart of cookieHeader.split(";")) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    const eqIndex = part.indexOf("=");
+    const key = (eqIndex === -1 ? part : part.slice(0, eqIndex)).trim();
+    const value = eqIndex === -1 ? "" : part.slice(eqIndex + 1).trim();
+    if (!key) continue;
+    map.set(key, value);
+  }
+  return map;
+}
+
+function serializeCookieMap(cookieMap) {
+  const parts = [];
+  for (const [key, value] of cookieMap.entries()) {
+    parts.push(value === "" ? key : `${key}=${value}`);
+  }
+  return parts.join("; ");
+}
+
+function mergeAndSanitizeCookieHeaders(baseCookieHeader, extraCookieHeader, blockedCookieNames = ["auth_token"]) {
+  const blocked = new Set(blockedCookieNames.map(name => String(name || "").trim().toLowerCase()).filter(Boolean));
+  const merged = parseCookieHeader(baseCookieHeader);
+  for (const key of [...merged.keys()]) {
+    if (blocked.has(String(key).trim().toLowerCase())) merged.delete(key);
+  }
+  const extra = parseCookieHeader(extraCookieHeader);
+  for (const [key, value] of extra.entries()) {
+    if (blocked.has(String(key).trim().toLowerCase())) continue;
+    merged.set(key, value);
+  }
+  const result = serializeCookieMap(merged);
+  return result || null;
+}
+
+function jsonHeaders(extra = {}) {
+  return { ...GLOBALS.SecurityHeaders, ...corsHeaders, "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store, max-age=0", ...extra };
+}
+
+function jsonResponse(payload, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(payload), { status, headers: jsonHeaders(extraHeaders) });
+}
+
+function jsonError(code, message, status = 400, details = null, extraHeaders = {}) {
+  const body = { ok: false, error: { code, message } };
+  if (details !== null && details !== undefined) body.error.details = details;
+  return jsonResponse(body, status, extraHeaders);
+}
+
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function mergeStatusPatch(base, patch) {
+  const source = isPlainObject(base) ? base : {};
+  const delta = isPlainObject(patch) ? patch : {};
+  const merged = { ...source };
+  for (const [key, value] of Object.entries(delta)) {
+    if (value === undefined) continue;
+    if (isPlainObject(value) && isPlainObject(source[key])) merged[key] = mergeStatusPatch(source[key], value);
+    else if (isPlainObject(value)) merged[key] = mergeStatusPatch({}, value);
+    else merged[key] = value;
+  }
+  return merged;
+}
+
+async function normalizeJsonApiResponse(response) {
+  const headers = new Headers(response.headers || {});
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("Cache-Control", "no-store, max-age=0");
+  Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
+  applySecurityHeaders(headers);
+  if (response.ok) return new Response(response.body, { status: response.status, headers });
+  let payload = null, fallbackText = "";
+  try { payload = await response.clone().json(); } catch { fallbackText = await response.text().catch(() => ""); }
+  const code = payload?.error?.code || (typeof payload?.error === "string" ? payload.error.toUpperCase() : `HTTP_${response.status}`);
+  const message = payload?.error?.message || payload?.message || (typeof payload?.error === "string" ? payload.error : fallbackText || response.statusText || "request_failed");
+  const details = payload?.error?.details ?? payload?.details ?? null;
+  return jsonError(code, message, response.status || 500, details);
+}
+
+const nowMs = () => Date.now();
+
+async function runWithConcurrency(items, limit, worker) {
+  const results = [], executing = [];
+  for (const item of items) {
+    const p = Promise.resolve().then(() => worker(item));
+    results.push(p);
+    if (limit <= items.length) {
+      const e = p.then(() => executing.splice(executing.indexOf(e), 1));
+      executing.push(e);
+      if (executing.length >= limit) await Promise.race(executing);
+    }
+  }
+  return Promise.all(results);
+}
+
 // ============================================================================
-// 1. AUTH MODULE
+// 1. 认证模块 (AUTH MODULE)
 // ============================================================================
 const Auth = {
-    // 智能获取 KV 绑定 (兼容多种命名)
-    getKV(env) {
-        return env.ENI_KV || env.KV || env.EMBY_KV || env.EMBY_PROXY;
-    },
-
-    async handleLogin(request, env) {
-        const ip = request.headers.get("cf-connecting-ip") || "unknown";
-        const kv = this.getKV(env);
-
-        try {
-            const formData = await request.formData();
-            const password = (formData.get("password") || "").trim();
-            const secret = env.JWT_SECRET || env.ADMIN_PASS;
-
-            if (password === env.ADMIN_PASS) {
-                if (kv) kv.delete(`fail:${ip}`).catch(() => { });
-                const jwt = await this.generateJwt(secret, Config.Defaults.JwtExpiry);
-                return new Response("Login Success", {
-                    status: 302,
-                    headers: {
-                        "Location": "/admin",
-                        "Set-Cookie": `auth_token=${jwt}; Path=/; Max-Age=${Config.Defaults.JwtExpiry}; HttpOnly; Secure; SameSite=Strict`
-                    }
-                });
-            }
-
-            let count = 0;
-            if (kv) {
-                const failKey = `fail:${ip}`;
-                const prev = await kv.get(failKey);
-                count = prev ? parseInt(prev) + 1 : 1;
-                if (count <= Config.Defaults.MaxLoginAttempts) {
-                    kv.put(failKey, count.toString(), { expirationTtl: Config.Defaults.LoginLockDuration }).catch(() => { });
-                }
-            }
-            if (count >= Config.Defaults.MaxLoginAttempts) return UI.renderLockedPage(ip);
-            return UI.renderLoginPage(`密码错误 (剩余次数: ${Config.Defaults.MaxLoginAttempts - count})`);
-        } catch (e) { return UI.renderLoginPage("请求无效"); }
-    },
-
-    async verifyRequest(request, env) {
-        const cookie = request.headers.get("Cookie");
-        if (!cookie) return false;
-        const match = cookie.match(/auth_token=([^;]+)/);
-        const token = match ? match[1] : null;
-        if (!token) return false;
-        return await this.verifyJwt(token, env.JWT_SECRET || env.ADMIN_PASS);
-    },
-
-    async generateJwt(secret, expiresIn) {
-        const header = { alg: "HS256", typ: "JWT" };
-        const payload = { sub: "admin", exp: Math.floor(Date.now() / 1000) + expiresIn };
-        const encHeader = this.base64UrlEncode(JSON.stringify(header));
-        const encPayload = this.base64UrlEncode(JSON.stringify(payload));
-        const signature = await this.sign(secret, `${encHeader}.${encPayload}`);
-        return `${encHeader}.${encPayload}.${signature}`;
-    },
-
-    async verifyJwt(token, secret) {
-        const parts = token.split('.');
-        if (parts.length !== 3) return false;
-        const [h, p, s] = parts;
-        const expected = await this.sign(secret, `${h}.${p}`);
-        if (s !== expected) return false;
-        try {
-            const payload = JSON.parse(this.base64UrlDecode(p));
-            return payload.exp > Math.floor(Date.now() / 1000);
-        } catch (e) { return false; }
-    },
-
-    base64UrlEncode(str) { return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); },
-    base64UrlDecode(str) { return atob(str.replace(/-/g, '+').replace(/_/g, '/')); },
-
-    async sign(secret, data) {
-        const enc = new TextEncoder();
-        const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-        const signature = await crypto.subtle.sign("HMAC", key, enc.encode(data));
-        return this.base64UrlEncode(String.fromCharCode(...new Uint8Array(signature)));
+  getKV(env) { return env.ENI_KV || env.KV || env.EMBY_KV || env.EMBY_PROXY; },
+  async handleLogin(request, env) {
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    const kv = this.getKV(env);
+    
+    const config = await getRuntimeConfig(env);
+    const jwtDays = Math.max(1, parseInt(config.jwtExpiryDays) || 30);
+    const expSeconds = jwtDays * 86400;
+    
+    const safeKVGet = async (key) => kv ? await kv.get(key).catch(e => null) : null;
+    const safeKVPut = async (key, val, opts) => kv ? await kv.put(key, val, opts).catch(e => null) : null;
+    const safeKVDelete = async (key) => kv ? await kv.delete(key).catch(e => null) : null;
+    try {
+      const failKey = `fail:${ip}`;
+      const prev = await safeKVGet(failKey);
+      const failCount = prev ? parseInt(prev) : 0;
+      if (failCount >= Config.Defaults.MaxLoginAttempts) return jsonError("TOO_MANY_ATTEMPTS", "账户已锁定，请稍后再试", 429);
+      let password = "";
+      const ct = request.headers.get("content-type") || "";
+      if (ct.includes("application/json")) {
+        const body = await request.json();
+        password = (body.password || "").trim();
+      }
+      if (!env.JWT_SECRET) return jsonError("SERVER_MISCONFIGURED", "JWT_SECRET 未配置", 503);
+      if (!env.ADMIN_PASS) return jsonError("SERVER_MISCONFIGURED", "ADMIN_PASS 未配置", 503);
+      if (password && password === env.ADMIN_PASS) {
+        await safeKVDelete(failKey);
+        const jwt = await this.generateJwt(env.JWT_SECRET, expSeconds);
+        return jsonResponse({ ok: true, expiresIn: expSeconds }, 200, { "Set-Cookie": `auth_token=${jwt}; Path=/; Max-Age=${expSeconds}; HttpOnly; Secure; SameSite=Strict` });
+      }
+      await safeKVPut(failKey, (failCount + 1).toString(), { expirationTtl: Config.Defaults.LoginLockDuration });
+      return jsonResponse({ ok: false, error: { code: "INVALID_PASSWORD", message: "密码错误" }, remain: Math.max(0, Config.Defaults.MaxLoginAttempts - (failCount + 1)) }, 401);
+    } catch (e) {
+      return jsonError("INVALID_REQUEST", "请求无效", 400, { reason: e.message });
     }
+  },
+  async verifyRequest(request, env) {
+    try {
+      const secret = env.JWT_SECRET;
+      if (!secret) return false;
+      const auth = request.headers.get("Authorization") || "";
+      let token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+      if (!token) {
+        const match = (request.headers.get("Cookie") || "").match(/(?:^|;\s*)auth_token=([^;]+)/);
+        token = match ? match[1] : null;
+      }
+      if (!token) return false;
+      return await this.verifyJwt(token, secret);
+    } catch { return false; }
+  },
+  async generateJwt(secret, expiresIn) {
+    const encHeader = btoa(JSON.stringify({ alg: "HS256", typ: "JWT" })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const encPayload = btoa(JSON.stringify({ sub: "admin", exp: Math.floor(Date.now() / 1000) + expiresIn })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const signature = await this.sign(secret, `${encHeader}.${encPayload}`);
+    return `${encHeader}.${encPayload}.${signature}`;
+  },
+  async verifyJwt(token, secret) {
+    const parts = token.split(".");
+    if (parts.length !== 3) return false;
+    if (parts[2] !== await this.sign(secret, `${parts[0]}.${parts[1]}`)) return false;
+    try { return JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"))).exp > Math.floor(Date.now() / 1000); } catch { return false; }
+  },
+  async sign(secret, data) {
+    const enc = new TextEncoder(), now = Date.now();
+    let entry = GLOBALS.CryptoKeyCache.get(secret);
+    if (!entry || entry.exp <= now) {
+      const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      entry = { key, exp: now + Config.Defaults.CryptoKeyCacheTTL * 1000 };
+      GLOBALS.CryptoKeyCache.set(secret, entry);
+    }
+    const signature = await crypto.subtle.sign("HMAC", entry.key, enc.encode(data));
+    return btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
 };
 
 // ============================================================================
-// 2. DATABASE MODULE
+// 2. 数据库与缓存模块 (DATABASE & CACHE MODULE)
 // ============================================================================
+const CacheManager = {
+  async getNodesList(env, ctx) {
+    if (GLOBALS.NodesListCache && GLOBALS.NodesListCache.exp > nowMs()) return GLOBALS.NodesListCache.data;
+    const kv = Database.getKV(env);
+    if (!kv) return [];
+    let nodeNames = GLOBALS.NodesIndexCache?.exp > nowMs() ? GLOBALS.NodesIndexCache.data : null;
+    if (!nodeNames) {
+      try {
+        nodeNames = await kv.get(Database.NODES_INDEX_KEY, { type: "json" });
+        if (Array.isArray(nodeNames)) GLOBALS.NodesIndexCache = { data: nodeNames, exp: nowMs() + 60000 };
+      } catch (e) {}
+    }
+    if (!nodeNames || !Array.isArray(nodeNames)) {
+      try {
+        const list = await kv.list({ prefix: "node:" });
+        nodeNames = list.keys.map(k => k.name.replace("node:", ""));
+        if (ctx && nodeNames.length > 0) ctx.waitUntil(kv.put(Database.NODES_INDEX_KEY, JSON.stringify(nodeNames)));
+        GLOBALS.NodesIndexCache = { data: nodeNames, exp: nowMs() + 60000 };
+      } catch (e) { return []; }
+    }
+    const nodes = await runWithConcurrency(nodeNames, Config.Defaults.NodesReadConcurrency, async (name) => {
+      try {
+        const cached = GLOBALS.NodeCache.get(name);
+        let val = cached?.exp > nowMs() ? cached.data : null;
+        if (!val) val = await kv.get(`${Database.PREFIX}${name}`, { type: "json" });
+        if (!val) return null;
+        const { data: normalized, changed } = Database.normalizeNode(name, val);
+        if (changed && ctx) ctx.waitUntil(kv.put(`${Database.PREFIX}${name}`, JSON.stringify(normalized)));
+        GLOBALS.NodeCache.set(name, { data: normalized, exp: nowMs() + Config.Defaults.CacheTTL });
+        return { name, ...normalized };
+      } catch { return null; }
+    });
+    const validNodes = nodes.filter(Boolean);
+    GLOBALS.NodesListCache = { data: validNodes, exp: nowMs() + 60000 };
+    return validNodes;
+  },
+  async invalidateList(ctx) { GLOBALS.NodesListCache = null; },
+  maybeCleanup() {
+    const budget = Config.Defaults.CleanupBudgetMs;
+    const chunkSize = Config.Defaults.CleanupChunkSize;
+    const state = GLOBALS.CleanupState;
+    const now = nowMs();
+    const start = now;
+    const cleanMap = (map, shouldDelete) => {
+      const scannedEntries = [];
+      for (const [k, v] of map) {
+        if (nowMs() - start >= budget) break;
+        scannedEntries.push([k, v]);
+        if (scannedEntries.length >= chunkSize) break;
+      }
+      for (const [k, v] of scannedEntries) {
+        if (nowMs() - start >= budget) break;
+        if (!map.has(k)) continue;
+        if (shouldDelete(v, now)) {
+          map.delete(k);
+          continue;
+        }
+        // 把已检查但未过期的热点项滚到尾部，避免每次清理都卡在 Map 前缀。
+        map.delete(k);
+        map.set(k, v);
+      }
+    };
+    if (state.phase === 0) {
+      cleanMap(GLOBALS.NodeCache, v => v?.exp && v.exp < now);
+      state.phase = 1;
+    } else if (state.phase === 1) {
+      cleanMap(GLOBALS.CryptoKeyCache, v => v?.exp && v.exp < now);
+      state.phase = 2;
+    } else if (state.phase === 2) {
+      cleanMap(GLOBALS.RateLimitCache, v => !v || v.resetAt < now);
+      state.phase = 3;
+    } else {
+      cleanMap(GLOBALS.LogDedupe, v => !v || (now - v) > 300000);
+      state.phase = 0;
+    }
+  }
+};
+
 const Database = {
-    PREFIX: "node:",
-    CONFIG_KEY: "sys:theme",
-
-    getKV(env) {
-        return Auth.getKV(env);
-    },
-
-    async getNode(nodeName, env, ctx) {
-        nodeName = nodeName.toLowerCase();
-        const kv = this.getKV(env);
-        if (!kv) return null;
-
-        const now = Date.now();
-        const mem = GLOBALS.NodeCache.get(nodeName);
-        if (mem && mem.exp > now) return mem.data;
-
-        const cache = caches.default;
-        const cacheUrl = new URL(`https://internal-config-cache/node/${nodeName}`);
-        let response = await cache.match(cacheUrl);
-        if (response) {
-            const data = await response.json();
-            GLOBALS.NodeCache.set(nodeName, { data, exp: now + Config.Defaults.CacheTTL });
-            return data;
-        }
-
-        try {
-            const nodeData = await kv.get(`${this.PREFIX}${nodeName}`, { type: "json" });
-            if (nodeData) {
-                const jsonStr = JSON.stringify(nodeData);
-                const cacheResp = new Response(jsonStr, {
-                    headers: { "Cache-Control": "public, max-age=60, stale-while-revalidate=600" }
-                });
-                ctx.waitUntil(cache.put(cacheUrl, cacheResp));
-                GLOBALS.NodeCache.set(nodeName, { data: nodeData, exp: now + Config.Defaults.CacheTTL });
-                return nodeData;
-            }
-        } catch (err) { console.error(`KV Error: ${err}`); }
-        return null;
-    },
-
-    async handleApi(request, env) {
-        const kv = this.getKV(env);
-        if (!kv) return new Response(JSON.stringify({ error: "KV未绑定! 请检查变量名是否为 ENI_KV 或 KV" }), { status: 500 });
-        
-        const data = await request.json();
-        const cache = caches.default;
-
-        const invalidate = async (name) => {
-            GLOBALS.NodeCache.delete(name);
-            await cache.delete(`https://internal-config-cache/node/${name}`);
-        };
-
-        switch (data.action) {
-            case "loadConfig":
-                let config = GLOBALS.ConfigCache;
-                if (!config) {
-                    config = await kv.get(this.CONFIG_KEY, { type: "json" }) || {};
-                    GLOBALS.ConfigCache = config;
-                }
-                return new Response(JSON.stringify(config));
-            
-            case "saveConfig":
-                if (data.config) {
-                    await kv.put(this.CONFIG_KEY, JSON.stringify(data.config));
-                    GLOBALS.ConfigCache = data.config;
-                }
-                return new Response(JSON.stringify({ success: true }));
-
-            case "save":
-            case "import":
-                const nodesToSave = data.action === "save" ? [data] : data.nodes;
-                for (const n of nodesToSave) {
-                    if (n.name && n.target) {
-                        const name = n.name.toLowerCase();
-                        const val = {
-                            secret: n.secret || n.path || "",
-                            target: n.target,
-                            tag: n.tag || ""
-                        };
-                        await kv.put(`${this.PREFIX}${name}`, JSON.stringify(val));
-                        await invalidate(name);
-                    }
-                }
-                return new Response(JSON.stringify({ success: true }));
-
-            case "delete":
-                if (data.name) {
-                    const delName = data.name.toLowerCase();
-                    await kv.delete(`${this.PREFIX}${delName}`);
-                    await invalidate(delName);
-                }
-                return new Response(JSON.stringify({ success: true }));
-
-            case "batchDelete":
-                if (Array.isArray(data.names)) {
-                    for (const name of data.names) {
-                        const batchName = name.toLowerCase();
-                        await kv.delete(`${this.PREFIX}${batchName}`);
-                        await invalidate(batchName);
-                    }
-                }
-                return new Response(JSON.stringify({ success: true }));
-
-            case "list":
-                try {
-                    const list = await kv.list({ prefix: this.PREFIX });
-                    const nodesList = await Promise.all(list.keys.map(async (key) => {
-                        try {
-                            const name = key.name.replace(this.PREFIX, "");
-                            let val = GLOBALS.NodeCache.get(name)?.data;
-                            if (!val) val = await kv.get(key.name, { type: "json" });
-                            return val ? { name, ...val } : null;
-                        } catch (e) { return null; }
-                    }));
-                    return new Response(JSON.stringify({ nodes: nodesList.filter(n => n) }));
-                } catch (e) {
-                    return new Response(JSON.stringify({ error: e.message }));
-                }
-
-            default: return new Response("Invalid Action", { status: 400 });
-        }
-    },
-
-    async findNodeByTargetHost(host, env, ctx) {
-        const kv = this.getKV(env);
-        if (!kv) return null;
-        try {
-            const list = await kv.list({ prefix: this.PREFIX });
-            for (const key of list.keys) {
-                const nodeData = await kv.get(key.name, { type: "json" });
-                if (nodeData && nodeData.target) {
-                    try {
-                        if (new URL(nodeData.target).host === host) {
-                            const name = key.name.replace(this.PREFIX, "").toLowerCase();
-                            return { name, secret: nodeData.secret || "" };
-                        }
-                    } catch (e) { }
-                }
-            }
-        } catch (e) { }
-        return null;
+  PREFIX: "node:", CONFIG_KEY: "sys:theme", NODES_INDEX_KEY: "sys:nodes_index:v1", OPS_STATUS_KEY: "sys:ops_status:v1",
+  getKV(env) { return Auth.getKV(env); },
+  getDB(env) { return env.DB || env.D1 || env.PROXY_LOGS; },
+  async getOpsStatus(kv) {
+    if (!kv) return {};
+    try { return await kv.get(this.OPS_STATUS_KEY, { type: "json" }) || {}; } catch { return {}; }
+  },
+  async patchOpsStatus(envOrKv, patch, ctx = null) {
+    const kv = envOrKv && typeof envOrKv.get === "function" ? envOrKv : this.getKV(envOrKv);
+    if (!kv) return {};
+    const current = await this.getOpsStatus(kv);
+    const next = mergeStatusPatch(current, patch);
+    next.updatedAt = new Date().toISOString();
+    const task = kv.put(this.OPS_STATUS_KEY, JSON.stringify(next));
+    if (ctx) ctx.waitUntil(task);
+    else await task;
+    return next;
+  },
+  normalizeNodeIndex(index = []) {
+    return [...new Set((Array.isArray(index) ? index : []).map(name => String(name || "").toLowerCase().trim()).filter(Boolean))];
+  },
+  async getNodesIndex(kv) {
+    if (GLOBALS.NodesIndexCache?.exp > nowMs() && Array.isArray(GLOBALS.NodesIndexCache.data)) {
+      return [...GLOBALS.NodesIndexCache.data];
     }
-};
+    if (!kv) return [];
+    const index = this.normalizeNodeIndex(await kv.get(this.NODES_INDEX_KEY, { type: "json" }) || []);
+    GLOBALS.NodesIndexCache = { data: index, exp: nowMs() + 60000 };
+    return [...index];
+  },
+  invalidateNodeCaches(nodeNames = [], options = {}) {
+    for (const rawName of Array.isArray(nodeNames) ? nodeNames : [nodeNames]) {
+      const name = String(rawName || "").toLowerCase().trim();
+      if (!name) continue;
+      GLOBALS.NodeCache.delete(name);
+    }
+    if (options.invalidateList) GLOBALS.NodesListCache = null;
+  },
+  async persistNodesIndex(index, { kv, ctx, invalidateList = false } = {}) {
+    const normalizedIndex = this.normalizeNodeIndex(index);
+    GLOBALS.NodesIndexCache = { data: normalizedIndex, exp: nowMs() + 60000 };
+    if (invalidateList) GLOBALS.NodesListCache = null;
+    if (!kv) return normalizedIndex;
+    const task = kv.put(this.NODES_INDEX_KEY, JSON.stringify(normalizedIndex));
+    if (ctx) ctx.waitUntil(task);
+    else await task;
+    return normalizedIndex;
+  },
+  getCurrentDateKey(now = new Date()) {
+    const utc8Now = new Date(now.getTime() + 8 * 3600 * 1000);
+    return `${utc8Now.getUTCFullYear()}-${String(utc8Now.getUTCMonth() + 1).padStart(2, "0")}-${String(utc8Now.getUTCDate()).padStart(2, "0")}`;
+  },
+  buildConfigCacheKeys(...configs) {
+    const dateKey = this.getCurrentDateKey();
+    const staleKeys = new Set(["sys:cf_dash_cache"]);
+    for (const config of configs) {
+      staleKeys.add(makeCfDashCacheKey(config?.cfZoneId));
+      staleKeys.add(makeCfDashCacheKey(config?.cfZoneId, dateKey));
+    }
+    return [...staleKeys].filter(Boolean);
+  },
+  async persistRuntimeConfig(rawConfig, { env, kv, ctx } = {}) {
+    if (!kv) return sanitizeRuntimeConfig(rawConfig);
+    const prevConfig = env
+      ? await getRuntimeConfig(env)
+      : sanitizeRuntimeConfig(await kv.get(this.CONFIG_KEY, { type: "json" }) || {});
+    const nextConfig = sanitizeRuntimeConfig(rawConfig);
+    await kv.put(this.CONFIG_KEY, JSON.stringify(nextConfig));
+    GLOBALS.ConfigCache = null;
+    const deleteTasks = this.buildConfigCacheKeys(prevConfig, nextConfig).map(key => kv.delete(key));
+    if (deleteTasks.length) {
+      if (ctx) ctx.waitUntil(Promise.all(deleteTasks));
+      else await Promise.all(deleteTasks);
+    }
+    return nextConfig;
+  },
+  
+  async sendDailyTelegramReport(env) {
+      const db = this.getDB(env);
+      const kv = this.getKV(env);
+      if (!db || !kv) throw new Error("Database or KV not configured");
 
-// ============================================================================
-// 3. PROXY MODULE (V17.5 API & Cache 深度优化版)
-// ============================================================================
-const Proxy = {
-    async handle(request, node, path, name, key, env, ctx) {
-        const targetBase = new URL(node.target);
-        const finalUrl = new URL(path, targetBase);
-        finalUrl.search = new URL(request.url).search;
+      const config = await kv.get(this.CONFIG_KEY, { type: "json" }) || {};
+      const tgBotToken = String(config.tgBotToken || "").trim();
+      const tgChatId = String(config.tgChatId || "").trim();
+      const cfAccountId = String(config.cfAccountId || "").trim();
+      const cfZoneId = String(config.cfZoneId || "").trim();
+      const cfApiToken = String(config.cfApiToken || "").trim();
+      if (!tgBotToken || !tgChatId) throw new Error("请先完善 Telegram Bot Token 和 Chat ID 配置");
 
-        // WebSocket 处理
-        if (request.headers.get("Upgrade") === "websocket") {
-            return this.handleWebSocket(finalUrl, request);
-        }
-        if (request.method === "OPTIONS") return this.renderCors();
+      const now = new Date();
+      const utc8Ms = now.getTime() + 8 * 3600 * 1000;
+      const d = new Date(utc8Ms);
+      const yyyy = d.getUTCFullYear();
+      const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+      const dd = String(d.getUTCDate()).padStart(2, '0');
+      const todayStr = `${mm}-${dd}`;
+      const dateString = `${yyyy}-${mm}-${dd}`;
 
-        // 1. 智能类型识别
-        const isStreaming = GLOBALS.Regex.Streaming.test(path);
-        // [API优化] 判定是否为静态资源 (包含图片、字幕、网页资源)
-        // 注意：Emby 的图片通常没有后缀，而是 /Items/xxx/Images/Primary，依靠 Regex.EmbyImages 识别
-        const isStatic = (GLOBALS.Regex.StaticExt.test(path) || GLOBALS.Regex.EmbyImages.test(path)) && request.method === 'GET';
+      const startOfDayTs = Date.UTC(yyyy, d.getUTCMonth(), d.getUTCDate()) - 8 * 3600 * 1000;
+      const endOfDayTs = startOfDayTs + 86400000 - 1;
+      const videoWhereClause = getVideoRequestWhereClause();
 
-        // 2. 构建请求头
-        const newHeaders = new Headers(request.headers);
-        newHeaders.set("Host", targetBase.host);
-        newHeaders.set("X-Real-IP", request.headers.get("cf-connecting-ip"));
-        newHeaders.set("X-Forwarded-For", request.headers.get("cf-connecting-ip"));
-        
-        // 移除 Cloudflare 内部头
-        ["cf-connecting-ip", "cf-ipcountry", "cf-ray", "cf-visitor", "cf-worker"].forEach(h => {
-             newHeaders.delete(h);
-        });
+      let reqTotal = 0, playCount = 0, infoCount = 0, totalAccMs = 0;
+      let cfTrafficStatus = "未找到今日缓存 (需打开面板刷新)";
+      let domainName = cfZoneId ? "Cloudflare (读取自缓存)" : "未接入 CF (读取自缓存)";
 
-        // [API优化] 视频流移除 Referer 防止防盗链误伤
-        if (isStreaming) newHeaders.delete("Referer");
+      try {
+          const cacheKey = makeCfDashCacheKey(cfZoneId, dateString);
+          let cached = await kv.get(cacheKey, { type: "json" });
+          
+          // 👇 加回这三行：如果缓存不存在，让定时任务主动假装前端请求一次，生成最新数据
+          if (!cached || cached.ver !== CF_DASH_CACHE_VERSION) {
+              await this.ApiHandlers.getDashboardStats({}, { env, ctx: null, kv, db }).catch(() => null);
+              cached = await kv.get(cacheKey, { type: "json" });
+          }
 
-        // [API优化] 针对静态资源(图片/CSS等)，主动移除 Range 头
-        // 作用：强制 Cloudflare 向源站请求完整文件。
-        // 原理：客户端请求海报可能分片下载，导致 CF 缓存碎片化。移除 Range 后，CF 会缓存整张图，后续请求直接由边缘节点切片响应。
-        if (isStatic) {
-            newHeaders.delete("Range");
-        }
+          if (cached && cached.ver === CF_DASH_CACHE_VERSION) {
+              reqTotal = Number(cached.todayRequests) || 0;
+              cfTrafficStatus = cached.todayTraffic || "0 B";
+              if (cfTrafficStatus === "未配置") cfTrafficStatus = "缓存暂无流量数据";
+              playCount = cached.playCount || 0;
+              infoCount = cached.infoCount || 0;
+              totalAccMs = cached.totalAccMs || 0;
+          }
+      } catch (e) {
+          cfTrafficStatus = "读取面板缓存异常";
+          console.log("Read CF cache failed", e);
+      }
 
-        // 3. 缓存策略与 CacheKey 计算 (核心优化)
-        let cf = { cacheEverything: false, cacheTtl: 0 };
+      let reqStr = reqTotal.toString();
+      if (reqTotal > 1000) reqStr = (reqTotal / 1000).toFixed(2) + "k";
 
-        if (isStatic) {
-            // [API优化] Cache Key 增强
-            // 目的：让 UserA 和 UserB，或者不同参数顺序的请求，命中同一个缓存文件
-            const cacheKeyUrl = new URL(finalUrl.toString());
-            
-            // a. 移除身份验证参数 (让不同用户共享同一份海报缓存)
-            // Emby 的图片 ID (GUID) 是唯一的，不带 Token 访问通常也是安全的(视服务器设置而定)，或者带 Token 访问后存为无 Token 的 Key
-            cacheKeyUrl.searchParams.delete("X-Emby-Token");
-            cacheKeyUrl.searchParams.delete("api_key");
-            cacheKeyUrl.searchParams.delete("X-Emby-Authorization");
-            
-            // b. 移除随机时间戳/防缓存参数 (强制命中缓存)
-            cacheKeyUrl.searchParams.delete("_");
-            cacheKeyUrl.searchParams.delete("t");
-            cacheKeyUrl.searchParams.delete("stamp");
-            cacheKeyUrl.searchParams.delete("random");
+      let accSecs = Math.floor(totalAccMs / 1000);
+      let accHrs = Math.floor(accSecs / 3600);
+      let accMins = Math.floor((accSecs % 3600) / 60);
+      let accRemSecs = accSecs % 60;
+      let accStr = `${accHrs}小时${accMins}分钟${accRemSecs}秒`;
 
-            // c. 参数排序 (让 ?w=100&h=200 和 ?h=200&w=100 命中同一缓存)
-            cacheKeyUrl.searchParams.sort();
+      const msgText = `📊 Cloudflare Zone 每日报表 (UTC+8)\n域名: ${domainName}\n\n📅 今天 (${todayStr})\n请求数: ${reqStr}\n视频流量 (CF 总计): ${cfTrafficStatus}\n请求: 播放请求 ${playCount} 次 | 获取播放信息 ${infoCount} 次\n\n🚀 共加速时长: ${accStr}\n#Cloudflare #Emby #日报`;
+      const tgUrl = `https://api.telegram.org/bot${tgBotToken}/sendMessage`;
+      const res = await fetch(tgUrl, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ chat_id: tgChatId, text: msgText })
+      });
+      const tgData = await res.json();
+      if (!tgData.ok) throw new Error(tgData.description || "Telegram API 返回错误");
+      return true;
+  },
 
-            cf = {
-                cacheEverything: true,
-                // [修复] 添加 cacheTtl 以满足类型定义，默认 30 天
-                cacheTtl: 86400 * 30,
-                // 使用清洗后的 URL 作为缓存键
-                cacheKey: cacheKeyUrl.toString(),
-                cacheTtlByStatus: { 
-                    "200-299": 86400 * 30, // 静态资源(海报) 缓存 30 天 (Emby图片有Tag参数控制版本，久存无害)
-                    "404": 60,             // 404 缓存 1 分钟
-                    "500-599": 0           // 错误不缓存
+  sanitizeHeaders(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+    const out = {};
+    for (const [rawKey, rawValue] of Object.entries(input)) {
+      const key = String(rawKey || "").trim();
+      if (!key) continue;
+      if (GLOBALS.DropRequestHeaders.has(key.toLowerCase())) continue;
+      out[key] = String(rawValue ?? "");
+    }
+    return out;
+  },
+  normalizeTargets(targetValue) {
+    const parts = String(targetValue || "").split(",").map(v => v.trim()).filter(Boolean);
+    if (!parts.length) return null;
+    const normalized = [];
+    for (const part of parts) {
+      try {
+        const url = new URL(part);
+        if (!["http:", "https:"].includes(url.protocol)) return null;
+        normalized.push(url.toString().replace(/\/$/, ""));
+      } catch {
+        return null;
+      }
+    }
+    return normalized.length ? normalized.join(",") : null;
+  },
+  normalizeNode(nodeName, data) {
+    const n = { ...data };
+    let changed = false;
+    if (!n.target) { n.target = ""; changed = true; }
+    if (n.secret === undefined) { n.secret = ""; changed = true; }
+    if (n.tag === undefined) { n.tag = ""; changed = true; }
+    if (n.remark === undefined) { n.remark = ""; changed = true; }
+    const normalizedHeaders = this.sanitizeHeaders(n.headers);
+    if (JSON.stringify(normalizedHeaders) !== JSON.stringify(n.headers || {})) changed = true;
+    n.headers = normalizedHeaders;
+    delete n.videoThrottling;
+    delete n.interceptMs;
+    if (!n.schemaVersion) { n.schemaVersion = 2; changed = true; }
+    if (!n.createdAt) { n.createdAt = new Date().toISOString(); changed = true; }
+    if (!n.updatedAt) { n.updatedAt = n.createdAt; changed = true; }
+    return { data: n, changed };
+  },
+  buildNodeRecord(name, rawNode, existingNode = {}) {
+    let parsedHeaders = rawNode?.headers !== undefined ? rawNode.headers : existingNode.headers;
+    if (typeof parsedHeaders === "string") {
+      try { parsedHeaders = JSON.parse(parsedHeaders); } catch { parsedHeaders = {}; }
+    }
+    const normalizedTargets = this.normalizeTargets(rawNode?.target || existingNode.target);
+    if (!normalizedTargets) return null;
+    return this.normalizeNode(name, {
+      target: normalizedTargets,
+      secret: rawNode?.secret !== undefined ? rawNode.secret : (existingNode.secret || ""),
+      tag: rawNode?.tag !== undefined ? rawNode.tag : (existingNode.tag || ""),
+      remark: rawNode?.remark !== undefined ? rawNode.remark : (existingNode.remark || ""),
+      headers: this.sanitizeHeaders(parsedHeaders),
+      schemaVersion: 2,
+      createdAt: existingNode.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }).data;
+  },
+  async getNode(nodeName, env, ctx) {
+    nodeName = String(nodeName).toLowerCase();
+    const kv = this.getKV(env); if (!kv) return null;
+    const mem = GLOBALS.NodeCache.get(nodeName);
+    if (mem && mem.exp > Date.now()) return mem.data;
+    try {
+      const nodeData = await kv.get(`${this.PREFIX}${nodeName}`, { type: "json" });
+      if (!nodeData) return null;
+      const { data: normalized, changed } = this.normalizeNode(nodeName, nodeData);
+      if (changed && ctx) ctx.waitUntil(kv.put(`${this.PREFIX}${nodeName}`, JSON.stringify(normalized)));
+      GLOBALS.NodeCache.set(nodeName, { data: normalized, exp: Date.now() + Config.Defaults.CacheTTL });
+      return normalized;
+    } catch { return null; }
+  },
+  normalizeAdminActionRequest(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+    const payload = input.payload && typeof input.payload === "object" && !Array.isArray(input.payload)
+      ? { ...input.payload }
+      : null;
+    const action = String(input.action ?? payload?.action ?? "").trim();
+    const meta = input.meta && typeof input.meta === "object" && !Array.isArray(input.meta) ? { ...input.meta } : {};
+    const data = payload
+      ? { ...payload, action, meta }
+      : { ...input, action, meta };
+    return { action, data, meta };
+  },
+  // ============================================================================
+  // 管理 API 动作表 (ADMIN ACTION MAP)
+  // 读取导航：
+  // - 面板统计 / 运行状态：getDashboardStats / getRuntimeStatus
+  // - 配置与备份：loadConfig / saveConfig / exportConfig / importFull
+  // - 节点治理：list / saveOrImport / delete / pingNode
+  // - 运维动作：getLogs / clearLogs / initLogsDb / purgeCache / testTelegram / sendDailyReport
+  // 设计意图：
+  // - 维持单文件部署，但把“动作分发”和“动作实现”拆成两个认知层次。
+  // - 新增 action 时，优先在这里挂处理器，再在 handleApi 做最小派发。
+  //
+  // [新增] API 路由处理器 (Action Handlers)
+  // 通过分离业务逻辑，消除 switch-case 带来的上下文污染
+  // ============================================================================
+  ApiHandlers: {
+    async getDashboardStats(data, { env, ctx, kv, db }) {
+      const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
+      let todayRequests = 0, todayTraffic = "未配置", nodeCount = 0;
+      let cfAnalyticsLoaded = false, requestsLoaded = false;
+      let cfAnalyticsStatus = "", cfAnalyticsError = "", cfAnalyticsDetail = "";
+      let requestSource = "pending", requestSourceText = "等待数据加载", trafficSourceText = "视频流量口径：CF Zone 总流量";
+      let generatedAt = new Date().toISOString();
+      let hourlySeries = Array.from({ length: 24 }, (_, hour) => ({ label: String(hour).padStart(2, "0") + ":00", total: 0 }));
+      let playCount = 0, infoCount = 0, totalAccMs = 0;
+
+      const nodes = await CacheManager.getNodesList(env, ctx);
+      nodeCount = nodes.length || 0;
+
+      const now = new Date();
+      const utc8Ms = now.getTime() + 8 * 3600 * 1000;
+      const d = new Date(utc8Ms);
+      const dateString = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      const startOfDayTs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - 8 * 3600 * 1000;
+      const endOfDayTs = startOfDayTs + 86400000 - 1;
+
+      const cfZoneId = String(config.cfZoneId || "").trim();
+      const cfApiToken = String(config.cfApiToken || "").trim();
+      const cacheKey = makeCfDashCacheKey(cfZoneId, dateString);
+      let cached = await kv.get(cacheKey, { type: "json" });
+
+      if (cached && cached.ver === CF_DASH_CACHE_VERSION && (Date.now() - cached.ts < 3600000) && Array.isArray(cached.hourlySeries)) {
+          return new Response(JSON.stringify({ nodeCount, ...cached, generatedAt: cached.generatedAt || new Date(cached.ts).toISOString(), cacheStatus: "cache" }), { headers: { ...corsHeaders } });
+      } 
+
+      if (cfZoneId && cfApiToken) {
+          const startIso = new Date(startOfDayTs).toISOString();
+          const endIso = new Date(endOfDayTs).toISOString();
+          const query = `
+          query {
+            viewer {
+              zones(filter: { zoneTag: ${toGraphQLString(cfZoneId)} }) {
+                series: httpRequestsAdaptiveGroups(limit: 10000, filter: { datetime_geq: ${toGraphQLString(startIso)}, datetime_leq: ${toGraphQLString(endIso)} }) {
+                  count
+                  dimensions { datetimeHour }
+                  sum { edgeResponseBytes }
                 }
-            };
-        }
-
-        try {
-            const response = await fetch(finalUrl.toString(), {
-                method: request.method,
-                headers: newHeaders,
-                body: request.body,
-                redirect: "manual",
-                cf
-            });
-
-            // 4. 响应头清洗与重写
-            const modifiedHeaders = new Headers(response.headers);
-            modifiedHeaders.set("Access-Control-Allow-Origin", "*");
-
-            if (isStatic) {
-                // [API优化] 移除 Vary 和 Set-Cookie，防止污染缓存
-                modifiedHeaders.delete("Vary");
-                modifiedHeaders.delete("Set-Cookie");
-                
-                // 强制浏览器本地缓存 1 年 (依靠 Emby 的 ?tag=xxx 机制更新)
-                // s-maxage=86400 控制 CDN 缓存时间
-                modifiedHeaders.set("Cache-Control", "public, max-age=31536000, s-maxage=86400");
-                
-                // 调试头：显示是否命中 (HIT/MISS)
-                modifiedHeaders.set("X-Emby-Proxy-Cache", "HIT");
-            } else if (isStreaming) {
-                // 视频流强制不缓存 (避免 CF 缓存视频切片导致回源错误)
-                modifiedHeaders.set("Cache-Control", "no-store");
+              }
             }
+          }`;
+          try {
+              const zoneData = await fetchCloudflareGraphQLZone(cfZoneId, cfApiToken, query);
+              if (zoneData) {
+                  let zoneTotalReq = 0, totalBytes = 0;
+                  let zoneHourlySeries = Array.from({ length: 24 }, (_, hour) => ({ label: String(hour).padStart(2, "0") + ":00", total: 0 }));
+                  const seriesData = Array.isArray(zoneData.series) ? [...zoneData.series].sort((a, b) => String(a?.dimensions?.datetimeHour || "").localeCompare(String(b?.dimensions?.datetimeHour || ""))) : [];
+                  seriesData.forEach(item => {
+                      const req = Number(item.count) || 0;
+                      const byt = Number(item.sum?.edgeResponseBytes) || 0;
+                      zoneTotalReq += req;
+                      totalBytes += byt;
+                      const dtRaw = item?.dimensions?.datetimeHour;
+                      if (dtRaw && !Number.isNaN(new Date(dtRaw).getTime())) {
+                          zoneHourlySeries[(new Date(dtRaw).getUTCHours() + 8) % 24].total += req;
+                      }
+                  });
+                  todayTraffic = formatBytes(totalBytes);
+                  cfAnalyticsLoaded = true;
+                  cfAnalyticsStatus = "Cloudflare 统计正常";
+                  trafficSourceText = "视频流量当前对齐：CF Zone 总流量（edgeResponseBytes）";
 
-            this.rewriteLocation(modifiedHeaders, response.status, name, key, targetBase);
-                        
-            // 跨 host 重定向改写：后端 302 到其他服务器时，查找匹配的代理节点
-            if (response.status >= 300 && response.status < 400) {
-                const location = modifiedHeaders.get("Location");
-                if (location && !location.startsWith("/")) {
-                    try {
-                        const locUrl = new URL(location);
-                        if (locUrl.host !== targetBase.host) {
-                            const matchNode = await Database.findNodeByTargetHost(locUrl.host, env, ctx);
-                            if (matchNode) {
-                                // 【修复】获取当前 CF Worker 的根域名 (如 https://proxy.yourdomain.com)
-                                const proxyOrigin = new URL(request.url).origin;
-                                
-                                const prefix = matchNode.secret
-                                    ? `/${matchNode.name}/${matchNode.secret}`
-                                    : `/${matchNode.name}`;
-                                    
-                                // 【修复】拼接成绝对路径，让 App 播放器能识别
-                                modifiedHeaders.set("Location", `${proxyOrigin}${prefix}${locUrl.pathname}${locUrl.search}`);
-                            }
+                  let resolvedRequestSource = "zone_analytics";
+                  try {
+                      const workerUsage = await fetchCloudflareWorkerUsageMetrics({ cfAccountId: String(config.cfAccountId || "").trim(), cfZoneId, cfApiToken, startIso, endIso });
+                      if (workerUsage && Number.isFinite(workerUsage.totalRequests)) {
+                          todayRequests = workerUsage.totalRequests;
+                          hourlySeries = workerUsage.hourlySeries;
+                          requestsLoaded = true;
+                          resolvedRequestSource = "workers_usage";
+                          requestSource = "workers_usage";
+                          requestSourceText = "今日请求量当前对齐：Cloudflare Workers Usage";
+                          cfAnalyticsStatus = "Cloudflare 统计正常（请求数已对齐 Workers Usage）";
+                          cfAnalyticsDetail = workerUsage.serviceNames?.length ? `已对齐脚本: ${workerUsage.serviceNames.join(", ")}` : cfAnalyticsDetail;
+                      }
+                  } catch (e) { console.log("CF workers usage fetch failed", e); }
+
+                  if (!requestsLoaded) {
+                      todayRequests = zoneTotalReq;
+                      hourlySeries = zoneHourlySeries;
+                      requestsLoaded = true;
+                      requestSource = "zone_analytics";
+                      requestSourceText = "今日请求量当前对齐：Cloudflare Zone Analytics";
+                  }
+              } else {
+                  cfAnalyticsStatus = "Zone 未命中";
+                  cfAnalyticsError = "GraphQL 返回空；请检查 Zone ID 或权限";
+                  todayTraffic = "CF 无统计数据";
+              }
+          } catch (e) {
+              const cfDiag = classifyCloudflareAnalyticsError(e?.message || e, { zoneId: cfZoneId });
+              cfAnalyticsStatus = cfDiag.status;
+              cfAnalyticsError = cfDiag.hint;
+              cfAnalyticsDetail = cfDiag.detail;
+              todayTraffic = "CF 查询失败";
+          }
+      } else {
+          cfAnalyticsStatus = "未配置 Cloudflare";
+          cfAnalyticsError = "请在账号设置中填写并保存 Cloudflare Zone ID 与 API 令牌";
+          requestSourceText = "今日请求量当前对齐：本地 D1 日志（兜底口径）";
+          trafficSourceText = "视频流量当前对齐：未配置 Cloudflare，无法获取 CF Zone 总流量";
+      }
+            if (db) {
+                try {
+                    const videoWhereClause = getVideoRequestWhereClause();
+                    playCount = (await db.prepare(`SELECT COUNT(*) as c FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? AND ${videoWhereClause}`).bind(startOfDayTs, endOfDayTs).first())?.c || 0;
+                    infoCount = (await db.prepare(`SELECT COUNT(*) as c FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? AND request_path LIKE '%/PlaybackInfo%'`).bind(startOfDayTs, endOfDayTs).first())?.c || 0;
+                    totalAccMs = (await db.prepare(`SELECT SUM(response_time) as st FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? AND ${videoWhereClause}`).bind(startOfDayTs, endOfDayTs).first())?.st || 0;
+
+                    if (!requestsLoaded) {
+                        todayRequests = (await db.prepare(`SELECT COUNT(*) as total FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ?`).bind(startOfDayTs, endOfDayTs).first())?.total || 0;
+                        const dbHourly = await db.prepare(`SELECT strftime('%H', datetime(timestamp / 1000 + 28800, 'unixepoch')) as hour, COUNT(*) as total FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? GROUP BY hour ORDER BY hour ASC`).bind(startOfDayTs, endOfDayTs).all();
+                        for (const row of dbHourly?.results || []) {
+                            const index = Number.parseInt(row.hour, 10);
+                            if (!Number.isNaN(index) && hourlySeries[index]) hourlySeries[index].total += (Number(row.total) || 0);
                         }
-                    } catch (e) { }
+                        requestsLoaded = true;
+                        requestSource = "d1_logs";
+                        requestSourceText = "今日请求量当前对齐：本地 D1 日志（兜底口径）";
+                    }
+                } catch (dbErr) {
+                    // 静默吞掉错误 (如新用户尚未初始化表)，确保 CF 流量数据仍能正常下发
+                    console.log("DB Stats read failed (table not init?):", dbErr);
                 }
             }
 
+            const cachePayload = JSON.stringify({
+          ver: CF_DASH_CACHE_VERSION, ts: Date.now(),
+          todayRequests, todayTraffic, hourlySeries,
+          requestSource, requestSourceText, trafficSourceText,
+          generatedAt,
+          cfAnalyticsLoaded, cfAnalyticsStatus, cfAnalyticsError, cfAnalyticsDetail,
+          playCount, infoCount, totalAccMs
+      });
+      
+      if (ctx) ctx.waitUntil(kv.put(cacheKey, cachePayload));
+      else await kv.put(cacheKey, cachePayload);
 
-            return new Response(response.body, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: modifiedHeaders
-            });
-
-        } catch (err) {
-            return UI.renderSmartError(request, err.message, name);
-        }
+      return new Response(JSON.stringify({ todayRequests, todayTraffic, nodeCount, hourlySeries, cfAnalyticsLoaded, cfAnalyticsStatus, cfAnalyticsError, cfAnalyticsDetail, requestSource, requestSourceText, trafficSourceText, generatedAt, cacheStatus: "live", playCount, infoCount, totalAccMs }), { headers: { ...corsHeaders } });      
     },
 
-    handleWebSocket(url, request) {
-        try {
-            const protocols = request.headers.get("Sec-WebSocket-Protocol") || "emby-websocket";
-            const wsTarget = new URL(url);
-            wsTarget.protocol = wsTarget.protocol === 'https:' ? 'wss:' : 'ws:';
-            const { 0: client, 1: server } = new WebSocketPair();
-            const ws = new WebSocket(wsTarget.toString(), protocols);
-            server.accept();
-            ws.addEventListener('message', e => { try { server.send(e.data) } catch { } });
-            server.addEventListener('message', e => { try { ws.send(e.data) } catch { } });
-            const close = () => {
-                try { server.close() } catch { }
-                try { ws.close() } catch { }
-            };
-            ws.addEventListener('close', close);
-            server.addEventListener('close', close);
-            ws.addEventListener('error', close);
-            server.addEventListener('error', close);
-            return new Response(null, {
-                status: 101,
-                webSocket: client,
-                headers: { "Sec-WebSocket-Protocol": protocols }
-            });
-        } catch (e) {
-            return new Response("WS Error", { status: 502 });
-        }
+    async loadConfig(data, { env }) {
+      return new Response(JSON.stringify({ config: await getRuntimeConfig(env) }), { headers: { ...corsHeaders } });
     },
 
-    rewriteLocation(headers, status, name, key, targetBase) {
-        if (status < 300 || status >= 400) return;
-        const location = headers.get("Location");
-        if (!location) return;
-        const prefix = key ? `/${name}/${key}` : `/${name}`;
-        if (location.startsWith("/")) {
-            headers.set("Location", `${prefix}${location}`);
+    async getRuntimeStatus(data, { kv }) {
+      return jsonResponse({ status: await Database.getOpsStatus(kv) });
+    },
+
+    async saveConfig(data, { env, ctx, kv }) {
+      if (data.config) {
+          await Database.persistRuntimeConfig(data.config, { env, kv, ctx });
+      }
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+    },
+
+    async exportConfig(data, { env, ctx }) {
+      return new Response(JSON.stringify({ 
+        version: Config.Defaults.Version, 
+        exportTime: new Date().toISOString(), 
+        nodes: (await CacheManager.getNodesList(env, ctx)).filter(Boolean), 
+        config: await getRuntimeConfig(env) 
+      }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    },
+
+    async list(data, { env, ctx }) {
+      return new Response(JSON.stringify({ nodes: await CacheManager.getNodesList(env, ctx) }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    },
+
+    async saveOrImport(data, { action, ctx, kv }) {
+      const nodesToSave = action === "save" ? [data] : data.nodes;
+      const savedNodes = [];
+      let index = await Database.getNodesIndex(kv);
+      
+      for (const n of nodesToSave) {
+        if (!n.name || !n.target) continue;
+        const name = String(n.name).toLowerCase();
+        const originalName = n.originalName ? String(n.originalName).toLowerCase() : null;
+        const isRename = !!(originalName && originalName !== name);
+        
+        let existingNode = {};
+        if (isRename) {
+            existingNode = await kv.get(`${Database.PREFIX}${originalName}`, { type: "json" }) || {};
         } else {
-            try {
-                const locUrl = new URL(location);
-                if (locUrl.host === targetBase.host) {
-                    headers.set("Location", `${prefix}${locUrl.pathname}${locUrl.search}`);
-                }
-            } catch (e) { }
+            existingNode = await kv.get(`${Database.PREFIX}${name}`, { type: "json" }) || {};
+        }
+        const val = Database.buildNodeRecord(name, n, existingNode);
+        if (!val) continue;
+        
+        await kv.put(`${Database.PREFIX}${name}`, JSON.stringify(val));
+        if (isRename) {
+          await kv.delete(`${Database.PREFIX}${originalName}`);
+          Database.invalidateNodeCaches([originalName, name], { invalidateList: true });
+          index = index.filter(x => x !== originalName);
+        } else {
+          Database.invalidateNodeCaches(name, { invalidateList: true });
+        }
+        savedNodes.push({ name, ...val });
+        index.push(name);
+      }
+      
+      if (savedNodes.length > 0) { 
+        await Database.persistNodesIndex(index, { kv, ctx, invalidateList: true });
+      }
+      
+      if (action === "save" && savedNodes.length === 0) return jsonError("INVALID_TARGET", "目标源站必须是有效的 http/https URL");
+      return new Response(JSON.stringify({ success: true, node: action === "save" ? savedNodes[0] : undefined, nodes: action === "import" ? savedNodes : undefined }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    },
+
+    async importFull(data, { env, ctx, kv }) {
+      if (data.config) await Database.persistRuntimeConfig(data.config, { env, kv, ctx });
+      if (data.nodes && Array.isArray(data.nodes)) {
+          const savedNodes = [];
+          let index = await Database.getNodesIndex(kv);
+          for (const n of data.nodes) {
+            if (!n.name || !n.target) continue;
+            const name = String(n.name).toLowerCase(); 
+            const existingNode = await kv.get(`${Database.PREFIX}${name}`, { type: "json" }) || {};
+            const val = Database.buildNodeRecord(name, n, existingNode);
+            if (!val) continue;
+            
+            await kv.put(`${Database.PREFIX}${name}`, JSON.stringify(val));
+            Database.invalidateNodeCaches(name, { invalidateList: true });
+            savedNodes.push(name);
+            index.push(name);
+          }
+          if (savedNodes.length > 0) {
+            await Database.persistNodesIndex(index, { kv, ctx, invalidateList: true });
+          }
+      }
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+    },
+
+    async delete(data, { ctx, kv }) {
+      if (data.name) {
+        const delName = String(data.name).toLowerCase(); 
+        await kv.delete(`${Database.PREFIX}${delName}`); 
+        Database.invalidateNodeCaches(delName, { invalidateList: true });
+        const index = (await Database.getNodesIndex(kv)).filter(n => n !== delName);
+        await Database.persistNodesIndex(index, { kv, ctx, invalidateList: true });
+      }
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+    },
+
+    async purgeCache(data, { kv }) {
+        const config = await kv.get(Database.CONFIG_KEY, { type: "json" }) || {};
+        if (!config.cfZoneId || !config.cfApiToken) return jsonError("CF_API_ERROR", "请在账号设置中完善 Zone ID 和 API 令牌");
+        try {
+            const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(String(config.cfZoneId).trim())}/purge_cache`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${config.cfApiToken}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ purge_everything: true })
+            });
+            if (res.ok) return jsonResponse({ success: true });
+            return jsonError("PURGE_FAILED", "清理失败，请检查密钥权限");
+        } catch(e) { return jsonError("PURGE_ERROR", e.message); }
+    },
+
+    async testTelegram(data) {
+        const { tgBotToken, tgChatId } = data;
+        if (!tgBotToken || !tgChatId) return jsonError("MISSING_PARAMS", "请先填写 Bot Token 和 Chat ID");
+        try {
+            const tgUrl = `https://api.telegram.org/bot${tgBotToken}/sendMessage`;
+            const msgText = "✅ Emby Proxy: Telegram 机器人测试通知成功！\n如果您能看到这条消息，说明您的通知配置完全正确。";
+            const tgRes = await fetch(tgUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chat_id: tgChatId, text: msgText })
+            });
+            const tgData = await tgRes.json();
+            if (tgData.ok) return jsonResponse({ success: true });
+            return jsonError("TG_API_ERROR", tgData.description || "Telegram API 返回错误，请检查 Token/ChatID");
+        } catch (e) {
+            return jsonError("NETWORK_ERROR", e.message);
         }
     },
 
-    renderCors() {
-        return new Response(null, {
-            headers: {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "*"
-            }
+    async sendDailyReport(data, { env }) {
+        try {
+            await Database.sendDailyTelegramReport(env);
+            return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+        } catch (e) {
+            return jsonError("REPORT_FAILED", e.message);
+        }
+    },
+
+    async pingNode(data, { env, ctx }) {
+        const node = await Database.getNode(data.name, env, ctx);
+        if (!node || !node.target) return jsonError("NOT_FOUND", "节点不存在");
+        const targets = String(node.target).split(",").map(i => i.trim()).filter(Boolean);
+        const start = Date.now();
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), parseInt(data.timeout || 5000));
+            await fetch(targets[0], { method: 'HEAD', signal: controller.signal });
+            clearTimeout(timeoutId);
+            return jsonResponse({ ms: Date.now() - start });
+        } catch (e) {
+            return jsonResponse({ ms: 9999 });
+        }
+    },
+
+    async getLogs(data, { db }) {
+      if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      const { page = 1, pageSize = 50, filters = {} } = data;
+      const offset = (page - 1) * pageSize;
+      let whereClause = [], params = [];
+      
+      if (filters.keyword) { 
+          whereClause.push("(node_name LIKE ? OR request_path LIKE ? OR client_ip LIKE ? OR category LIKE ? OR CAST(status_code AS TEXT) LIKE ?)"); 
+          params.push(`%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`); 
+      }
+      if (filters.category) { whereClause.push("category = ?"); params.push(filters.category); }
+      if (filters.startDate) { whereClause.push("timestamp >= ?"); params.push(new Date(filters.startDate).getTime()); }
+      if (filters.endDate) { whereClause.push("timestamp <= ?"); params.push(new Date(filters.endDate + "T23:59:59").getTime()); }
+      
+      const where = whereClause.length > 0 ? "WHERE " + whereClause.join(" AND ") : "";
+      const total = (await db.prepare(`SELECT COUNT(*) as total FROM proxy_logs ${where}`).bind(...params).first())?.total || 0;
+      const logsResult = await db.prepare(`SELECT * FROM proxy_logs ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`).bind(...params, pageSize, offset).all();
+      
+      return new Response(JSON.stringify({ logs: logsResult.results || [], total, page, pageSize, totalPages: Math.ceil(total / pageSize) }), { headers: { ...corsHeaders } });
+    },
+
+    async clearLogs(data, { db }) {
+      if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
+      await db.prepare("DELETE FROM proxy_logs").run();
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+    },
+
+    async initLogsDb(data, { db }) {
+      if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
+      await db.prepare(`CREATE TABLE IF NOT EXISTS proxy_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', created_at TEXT NOT NULL)`).run();
+      try { await db.prepare(`ALTER TABLE proxy_logs ADD COLUMN category TEXT DEFAULT 'api'`).run(); } catch (e) { /* ignore */ }
+      try { await db.prepare(`ALTER TABLE proxy_logs ADD COLUMN error_detail TEXT`).run(); } catch (e) { /* ignore */ }
+      
+      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON proxy_logs (timestamp)`).run();
+      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_ip ON proxy_logs (client_ip)`).run();
+      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_node_time ON proxy_logs (node_name, timestamp)`).run();
+      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category ON proxy_logs (category)`).run();
+      
+      return new Response(JSON.stringify({ success: true, schemaVersion: 2, categoryEnabled: true }), { headers: { ...corsHeaders } });
+    }
+  },
+
+  // ============================================================================
+  // 重构后的 handleApi 主函数：极简派发器
+  // 边界说明：
+  // 1. 这里只做四件事：鉴别 KV、解析 JSON、归一 action、构造上下文后派发。
+  // 2. 这里不承载业务判断，业务复杂度应留在 ApiHandlers 的具体动作中。
+  // 3. 当需要新增管理功能时，优先保证这里继续保持“薄派发层”。
+  // ============================================================================
+  async handleApi(request, env, ctx) {
+    const kv = this.getKV(env);
+    if (!kv) {
+        return new Response(JSON.stringify({ error: "kv_missing" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    let data; 
+    try { 
+        data = await request.json(); 
+    } catch { 
+        return jsonError("INVALID_JSON", "请求 JSON 无效", 400); 
+    }
+
+    const normalizedRequest = this.normalizeAdminActionRequest(data);
+    if (!normalizedRequest) {
+        return jsonError("INVALID_REQUEST", "请求体必须是 JSON 对象", 400);
+    }
+
+    const actionName = (normalizedRequest.action === "save" || normalizedRequest.action === "import") ? "saveOrImport" : normalizedRequest.action;
+    const handler = this.ApiHandlers[actionName];
+
+    if (!handler) {
+        return jsonError("INVALID_ACTION", "未知的管理动作", 400, { action: normalizedRequest.action || null });
+    }
+
+    const context = {
+        action: normalizedRequest.action,
+        meta: normalizedRequest.meta,
+        request,
+        env,
+        ctx,
+        kv,
+        db: this.getDB(env)
+    };
+
+    return await handler.call(this, normalizedRequest.data, context);
+  }
+};
+
+// ============================================================================
+// 3. 代理模块 (PROXY MODULE - 核心缓冲防护与 CORS 重构)
+// ============================================================================
+function normalizeEmbyAuthHeaders(headers, method = "GET", path = "") {
+  // 1. 安全提取并清洗现有 Header
+  const embyAuth = headers.get("X-Emby-Authorization")?.trim();
+  const stdAuth = headers.get("Authorization")?.trim();
+  const isEmbyStd = stdAuth?.toLowerCase().startsWith("emby ");
+
+  // 2. 确立单一真相源 (Source of Truth)
+  // 优先级: X-Emby-Auth > 符合规范的 Std Auth > null
+  let finalAuth = embyAuth || (isEmbyStd ? stdAuth : null);
+
+  // 3. 登录 API 强制补头兜底
+  if (!finalAuth && method.toUpperCase() === "POST" && path.toLowerCase().includes("/users/authenticatebyname")) {
+      finalAuth = 'Emby Client="Emby Proxy Patch", Device="Browser", DeviceId="proxy-login-patch", Version="1.0.0"';
+  }
+
+  // 4. 双向同步 (解决冲突与缺失)
+  if (finalAuth) {
+      headers.set("X-Emby-Authorization", finalAuth);
+      
+      // 仅在 Authorization 为空，或确认其也是 Emby 格式时才覆盖
+      // 绝对不覆盖正常的 Bearer/Basic 认证头
+      if (!stdAuth || isEmbyStd) {
+          headers.set("Authorization", finalAuth);
+      }
+  }
+  
+  return headers;
+}
+const Proxy = {
+  // Proxy 模块阅读顺序建议：
+  // 1. resolve/evaluate/classify：环境裁决与请求分类
+  // 2. build*：请求状态、响应头、跳转头整形
+  // 3. perform/fetch*：上游访问与重试循环
+  // 4. handle：把上述阶段串成完整代理链路
+  resolveCorsOrigin(currentConfig, request) {
+    const reqOrigin = request.headers.get("Origin");
+    const allowedOrigins = String(currentConfig.corsOrigins || "").split(",").map(i => i.trim()).filter(Boolean);
+    if (allowedOrigins.length > 0) return reqOrigin && allowedOrigins.includes(reqOrigin) ? reqOrigin : allowedOrigins[0];
+    return reqOrigin || "*";
+  },
+  buildEdgeResponseHeaders(finalOrigin, extra = {}) {
+    const headers = new Headers({ "Access-Control-Allow-Origin": finalOrigin, "Cache-Control": "no-store", ...extra });
+    applySecurityHeaders(headers);
+    return headers;
+  },
+  classifyRequest(request, proxyPath, requestUrl, currentConfig) {
+    const rangeHeader = request.headers.get("Range");
+    const enablePrewarm = currentConfig.enablePrewarm !== false;
+    const prewarmCacheTtl = parseInt(currentConfig.prewarmCacheTtl) || 180;
+    const prewarmPrefetchBytes = Math.max(0, parseInt(currentConfig.prewarmPrefetchBytes) || (4 * 1024 * 1024));
+    const isHeadPrewarm =
+      enablePrewarm &&
+      (request.method === "GET" || request.method === "HEAD") &&
+      !!rangeHeader &&
+      /^bytes=0-(\d{0,7})?$/.test(rangeHeader);
+    const isImage = GLOBALS.Regex.EmbyImages.test(proxyPath) || GLOBALS.Regex.StaticExt.test(proxyPath);
+    const isSubtitle = GLOBALS.Regex.SubtitleExt.test(proxyPath);
+    const isManifest = GLOBALS.Regex.ManifestExt.test(proxyPath);
+    const isSegment = GLOBALS.Regex.SegmentExt.test(proxyPath);
+    const isWsUpgrade = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+    const looksLikeVideoRoute = GLOBALS.Regex.Streaming.test(proxyPath) || /\/videos\/[^/]+\/(stream|original|download|file)/i.test(proxyPath) || /\/items\/[^/]+\/download/i.test(proxyPath) || requestUrl.searchParams.get("Static") === "true" || requestUrl.searchParams.get("Download") === "true";
+    const isBigStream = looksLikeVideoRoute && !isManifest && !isSegment && !isHeadPrewarm;
+    const isCacheableAsset = request.method === "GET" && !isWsUpgrade && (isImage || isSubtitle || isSegment || isHeadPrewarm);
+    return {
+      rangeHeader,
+      enablePrewarm,
+      prewarmCacheTtl,
+      prewarmPrefetchBytes,
+      isHeadPrewarm,
+      isImage,
+      isSubtitle,
+      isManifest,
+      isSegment,
+      isWsUpgrade,
+      looksLikeVideoRoute,
+      isBigStream,
+      isCacheableAsset
+    };
+  },
+  evaluateFirewall(currentConfig, clientIp, country, finalOrigin) {
+    const ipBlacklist = String(currentConfig.ipBlacklist || "").split(",").map(i => i.trim()).filter(Boolean);
+    if (ipBlacklist.includes(clientIp)) {
+      return new Response("Forbidden by IP Firewall", { status: 403, headers: this.buildEdgeResponseHeaders(finalOrigin) });
+    }
+
+    const geoAllow = String(currentConfig.geoAllowlist || "").split(",").map(i => i.trim().toUpperCase()).filter(Boolean);
+    const geoBlock = String(currentConfig.geoBlocklist || "").split(",").map(i => i.trim().toUpperCase()).filter(Boolean);
+    if ((geoAllow.length > 0 && !geoAllow.includes(country)) || (geoBlock.length > 0 && geoBlock.includes(country))) {
+      return new Response("Forbidden by Geo Firewall", { status: 403, headers: this.buildEdgeResponseHeaders(finalOrigin) });
+    }
+
+    return null;
+  },
+  applyRateLimit(currentConfig, clientIp, requestTraits, startTime, finalOrigin) {
+    const rpmLimit = parseInt(currentConfig.rateLimitRpm) || 0;
+    const shouldRateLimit = rpmLimit > 0 && !(requestTraits.isManifest || requestTraits.isSegment || requestTraits.isHeadPrewarm || requestTraits.isBigStream);
+    if (!shouldRateLimit) return null;
+    let rlData = GLOBALS.RateLimitCache.get(clientIp);
+    if (!rlData || startTime > rlData.resetAt) rlData = { count: 0, resetAt: startTime + 60000 };
+    rlData.count += 1;
+    GLOBALS.RateLimitCache.set(clientIp, rlData);
+    if (rlData.count > rpmLimit) {
+      return new Response("Rate Limit Exceeded", { status: 429, headers: this.buildEdgeResponseHeaders(finalOrigin) });
+    }
+    return null;
+  },
+  parseTargetBases(node, finalOrigin) {
+    const targetBases = String(node.target || "").split(",").map(item => item.trim()).filter(Boolean).map(item => {
+      try { return new URL(item); } catch { return null; }
+    }).filter(url => url && ["http:", "https:"].includes(url.protocol));
+    if (!targetBases.length) {
+      return { targetBases, invalidResponse: new Response("Invalid Node Target", { status: 502, headers: this.buildEdgeResponseHeaders(finalOrigin) }) };
+    }
+    return { targetBases, invalidResponse: null };
+  },
+  buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases) {
+    const newHeaders = new Headers(request.headers);
+    GLOBALS.DropRequestHeaders.forEach(h => newHeaders.delete(h));
+
+    const adminCustomHeaders = new Set();
+    let adminCustomCookie = null;
+    if (node.headers && typeof node.headers === "object") {
+      for (const [hKey, hVal] of Object.entries(node.headers)) {
+        const lowerKey = String(hKey).toLowerCase();
+        if (GLOBALS.DropRequestHeaders.has(lowerKey)) continue;
+        adminCustomHeaders.add(lowerKey);
+        if (lowerKey === "cookie") adminCustomCookie = String(hVal);
+        else newHeaders.set(hKey, String(hVal));
+      }
+    }
+
+    const mergedCookie = mergeAndSanitizeCookieHeaders(newHeaders.get("Cookie"), adminCustomCookie, ["auth_token"]);
+    if (mergedCookie) newHeaders.set("Cookie", mergedCookie);
+    else newHeaders.delete("Cookie");
+
+    normalizeEmbyAuthHeaders(newHeaders, request.method, proxyPath);
+
+    newHeaders.set("X-Real-IP", clientIp);
+    newHeaders.set("X-Forwarded-For", clientIp);
+    newHeaders.set("X-Forwarded-Host", requestUrl.host);
+    newHeaders.set("X-Forwarded-Proto", requestUrl.protocol.replace(":", ""));
+    if (requestTraits.isWsUpgrade) {
+      newHeaders.set("Upgrade", "websocket");
+      newHeaders.set("Connection", "Upgrade");
+    } else if (forceH1) {
+      newHeaders.set("Connection", "keep-alive");
+    }
+    if ((requestTraits.isBigStream || requestTraits.isSegment || requestTraits.isManifest) && !adminCustomHeaders.has("referer")) {
+      newHeaders.delete("Referer");
+    }
+
+    const isNonIdempotent = request.method !== "GET" && request.method !== "HEAD";
+    const preparedBody = isNonIdempotent ? request.body : null;
+    const preparedBodyMode = (isNonIdempotent && request.body) ? "stream" : "none";
+    const retryTargets = isNonIdempotent ? targetBases.slice(0, 1) : targetBases;
+
+    return {
+      newHeaders,
+      adminCustomHeaders,
+      preparedBody,
+      preparedBodyMode,
+      retryTargets
+    };
+  },
+  evaluateRedirectDecision(nextUrl, activeTargetBase, redirectMethod, redirectBodyMode, policy) {
+    const isSameOriginRedirect = nextUrl.origin === activeTargetBase.origin;
+    const mustDirect = isSameOriginRedirect
+      ? !policy.sourceSameOriginProxy
+      : (!policy.forceExternalProxy || shouldDirectByWangpan(nextUrl, policy.wangpanDirectKeywords));
+    if (mustDirect) {
+      return { mustDirect: true, nextMethod: null, nextBodyMode: redirectBodyMode, isSameOriginRedirect };
+    }
+    const nextMethod = normalizeRedirectMethod(policy.currentStatus, redirectMethod);
+    let nextBodyMode = redirectBodyMode;
+    if (nextMethod === "GET" || nextMethod === "HEAD") nextBodyMode = "none";
+    else if (redirectBodyMode === "stream") {
+      return { mustDirect: true, nextMethod, nextBodyMode: redirectBodyMode, isSameOriginRedirect };
+    }
+    return { mustDirect: false, nextMethod, nextBodyMode, isSameOriginRedirect };
+  },
+  buildProxyResponseHeaders(response, request, dynamicCors, finalOrigin, requestTraits, options = {}) {
+    const modifiedHeaders = new Headers(response.headers);
+
+    if (GLOBALS.DropResponseHeaders) {
+      GLOBALS.DropResponseHeaders.forEach(h => modifiedHeaders.delete(h));
+    }
+
+    modifiedHeaders.set("Access-Control-Allow-Origin", finalOrigin);
+
+    if (dynamicCors && dynamicCors["Access-Control-Expose-Headers"]) {
+      modifiedHeaders.set("Access-Control-Expose-Headers", dynamicCors["Access-Control-Expose-Headers"]);
+    }
+
+    if (dynamicCors && dynamicCors["Access-Control-Allow-Methods"]) {
+      modifiedHeaders.set("Access-Control-Allow-Methods", dynamicCors["Access-Control-Allow-Methods"]);
+    }
+
+    const resReqHeaders = request.headers.get("Access-Control-Request-Headers");
+    if (resReqHeaders) {
+      modifiedHeaders.set("Access-Control-Allow-Headers", resReqHeaders);
+      mergeVaryHeader(modifiedHeaders, "Access-Control-Request-Headers");
+    } else if (dynamicCors && dynamicCors["Access-Control-Allow-Headers"]) {
+      modifiedHeaders.set("Access-Control-Allow-Headers", dynamicCors["Access-Control-Allow-Headers"]);
+    }
+
+    if (finalOrigin !== "*") {
+      mergeVaryHeader(modifiedHeaders, "Origin");
+    }
+
+    if (!options.enableH3 || options.forceH1) {
+      modifiedHeaders.delete("Alt-Svc");
+    }
+
+    if (requestTraits.isImage || requestTraits.isSubtitle || requestTraits.isManifest) {
+      modifiedHeaders.set("Cache-Control", "public, max-age=86400");
+    } else if (requestTraits.isHeadPrewarm) {
+      modifiedHeaders.set("Cache-Control", `public, max-age=${requestTraits.prewarmCacheTtl}`);
+    } else if (requestTraits.isBigStream || options.proxiedExternalRedirect) {
+      modifiedHeaders.set("Cache-Control", "no-store");
+    }
+
+    applySecurityHeaders(modifiedHeaders);
+    return modifiedHeaders;
+  },
+  applyProxyRedirectHeaders(modifiedHeaders, response, activeTargetBase, name, key, directRedirectUrl) {
+    if (directRedirectUrl) {
+      modifiedHeaders.set("Location", directRedirectUrl.toString());
+      modifiedHeaders.set("Cache-Control", "no-store");
+      return;
+    }
+    if (!(response.status >= 300 && response.status < 400)) return;
+    const location = modifiedHeaders.get("Location");
+    if (!location) return;
+    const prefix = buildProxyPrefix(name, key);
+    if (location.startsWith("/")) {
+      modifiedHeaders.set("Location", prefix + location);
+      return;
+    }
+    try {
+      const locUrl = new URL(location);
+      if (locUrl.origin === activeTargetBase.origin) {
+        modifiedHeaders.set("Location", prefix + locUrl.pathname + locUrl.search + locUrl.hash);
+      }
+    } catch {}
+  },
+  classifyProxyLogCategory(requestTraits) {
+    if (requestTraits.isSegment) return "segment";
+    if (requestTraits.isHeadPrewarm) return "prewarm";
+    if (requestTraits.isManifest) return "manifest";
+    if (requestTraits.isBigStream) return "stream";
+    if (requestTraits.isImage) return "image";
+    if (requestTraits.isSubtitle) return "subtitle";
+    if (requestTraits.isWsUpgrade) return "websocket";
+    return "api";
+  },
+  extractProxyErrorDetail(response) {
+    if (response.status < 400) return null;
+    const hints = [];
+    const srv = response.headers.get("Server");
+    if (srv) hints.push(`Server: ${srv}`);
+    const ray = response.headers.get("CF-Ray");
+    if (ray) hints.push(`CF-Ray: ${ray}`);
+    const embyErr = response.headers.get("X-Application-Error-Code") || response.headers.get("X-Emby-Error");
+    if (embyErr) hints.push(`Emby-Error: ${embyErr}`);
+    const cfCache = response.headers.get("CF-Cache-Status");
+    if (cfCache) hints.push(`CF-Cache: ${cfCache}`);
+    return hints.length > 0 ? hints.join(" | ") : response.statusText;
+  },
+  shouldRetryWithProtocolFallback(response, state = {}) {
+    if (response.status !== 403) return false;
+    if (state.isRetry !== false) return false;
+    if (state.protocolFallback !== true) return false;
+    if (state.preparedBodyMode === "stream") return false;
+    return true;
+  },
+  async performUpstreamFetch(targetBase, proxyPath, requestUrl, buildFetchOptions, options = {}) {
+    const finalUrl = new URL(proxyPath, targetBase);
+    finalUrl.search = requestUrl.search;
+    const fetchOptions = await buildFetchOptions(finalUrl, options);
+    const response = await fetch(finalUrl.toString(), fetchOptions);
+    return { response, targetBase, finalUrl };
+  },
+  async fetchUpstreamWithRetryLoop(state) {
+    let lastError = null;
+    let lastResponse = null;
+    let lastBase = state.retryTargets[0];
+    let lastFinalUrl = new URL(state.proxyPath, lastBase);
+    lastFinalUrl.search = state.requestUrl.search;
+
+    for (let index = 0; index < state.retryTargets.length; index++) {
+      const targetBase = state.retryTargets[index];
+      lastBase = targetBase;
+      try {
+        const upstream = await this.performUpstreamFetch(targetBase, state.proxyPath, state.requestUrl, state.buildFetchOptions, { isRetry: state.isRetry });
+        lastFinalUrl = upstream.finalUrl;
+        const response = upstream.response;
+
+        if (response.status === 101) {
+          return upstream;
+        }
+
+        if (this.shouldRetryWithProtocolFallback(response, state)) {
+          try { response.body?.cancel?.(); } catch {}
+          return await this.fetchUpstreamWithRetryLoop({ ...state, isRetry: true });
+        }
+
+        if (!state.retryableStatuses.has(response.status) || index === state.retryTargets.length - 1) {
+          return upstream;
+        }
+
+        if (lastResponse) {
+          try { lastResponse.body?.cancel?.(); } catch {}
+        }
+        lastResponse = response;
+      } catch (error) {
+        lastError = error;
+        if (index === state.retryTargets.length - 1) throw error;
+      }
+    }
+
+    if (lastResponse) return { response: lastResponse, targetBase: lastBase, finalUrl: lastFinalUrl };
+    throw lastError || new Error("upstream_fetch_failed");
+  },
+  async handle(request, node, path, name, key, env, ctx, options = {}) {
+    // Proxy.handle 阶段图（单文件内的执行主链）：
+    // Phase A. 环境准备：配置、来源、CORS、客户端身份
+    // Phase B. 前置裁决：OPTIONS / 防火墙 / 限流 / 目标源合法性
+    // Phase C. 请求整备：分类、头部整理、body/重试目标准备
+    // Phase D. 上游访问：fetch + 协议回退 + 多目标重试
+    // Phase E. 跳转决策：同源/异源、直连/继续代理
+    // Phase F. 响应整形：缓存头、CORS、Location 改写
+    // Phase G. 观测记录：分类、状态码、错误细节、耗时
+    const startTime = Date.now();
+    CacheManager.maybeCleanup();
+    if (!node || !node.target) return new Response("Invalid Node", { status: 502, headers: applySecurityHeaders(new Headers()) });
+
+    const currentConfig = await getRuntimeConfig(env);
+    const requestUrl = options.requestUrl || new URL(request.url);
+    const proxyPath = sanitizeProxyPath(path);
+    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const country = request.cf?.country || "UNKNOWN";
+    const finalOrigin = this.resolveCorsOrigin(currentConfig, request);
+    const dynamicCors = getCorsHeadersForResponse(env, request, finalOrigin);
+
+    if (request.method === "OPTIONS") {
+      const headers = new Headers(dynamicCors);
+      applySecurityHeaders(headers);
+      if (finalOrigin !== "*") mergeVaryHeader(headers, "Origin");
+      return new Response(null, { headers });
+    }
+
+    const blockedResponse = this.evaluateFirewall(currentConfig, clientIp, country, finalOrigin);
+    if (blockedResponse) return blockedResponse;
+
+    const requestTraits = this.classifyRequest(request, proxyPath, requestUrl, currentConfig);
+    const { rangeHeader, enablePrewarm, prewarmCacheTtl, prewarmPrefetchBytes, isHeadPrewarm, isImage, isSubtitle, isManifest, isSegment, isWsUpgrade, looksLikeVideoRoute, isBigStream, isCacheableAsset } = requestTraits;
+
+    const rateLimitResponse = this.applyRateLimit(currentConfig, clientIp, requestTraits, startTime, finalOrigin);
+    if (rateLimitResponse) return rateLimitResponse;
+
+    const enableH2 = currentConfig.enableH2 === true;
+    const enableH3 = currentConfig.enableH3 === true;
+    const peakDowngrade = currentConfig.peakDowngrade !== false;
+    const protocolFallback = currentConfig.protocolFallback !== false; 
+    const utc8Hour = (new Date().getUTCHours() + 8) % 24;
+    const isPeakHour = utc8Hour >= 20 && utc8Hour < 24;
+    const forceH1 = (peakDowngrade && isPeakHour) || (!enableH2 && !enableH3);
+
+    const { targetBases, invalidResponse } = this.parseTargetBases(node, finalOrigin);
+    if (invalidResponse) return invalidResponse;
+    const { newHeaders, adminCustomHeaders, preparedBody, preparedBodyMode, retryTargets } =
+      this.buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases);
+
+    const sourceSameOriginProxy = currentConfig.sourceSameOriginProxy !== false;
+    const forceExternalProxy = currentConfig.forceExternalProxy !== false;
+    const wangpanDirectKeywords = getWangpanDirectText(currentConfig.wangpandirect || "");
+    const nodeDirectSource = isNodeDirectSourceEnabled(node, currentConfig);
+
+    const buildFetchOptions = async (targetUrl, options = {}) => {
+      const headers = new Headers(newHeaders);
+      const finalTargetUrl = targetUrl instanceof URL ? targetUrl : new URL(String(targetUrl));
+      const targetOrigin = finalTargetUrl.origin;
+      const effectiveMethod = String(options.method || request.method || "GET").toUpperCase();
+      const effectiveBodyMode = options.bodyMode || preparedBodyMode;
+      const effectiveBody = options.body !== undefined ? options.body : preparedBody;
+      const isRetry = options.isRetry === true;
+      const isExternalRedirect = options.isExternalRedirect === true;
+
+      if (headers.has("Origin") && !adminCustomHeaders.has("origin")) {
+        headers.set("Origin", targetOrigin);
+      }
+
+      if (headers.has("Referer") && !adminCustomHeaders.has("referer")) {
+        try {
+          const originalReferer = new URL(headers.get("Referer"));
+          if (originalReferer.origin !== targetOrigin) {
+            const safeReferer = new URL(originalReferer.pathname + originalReferer.search, targetOrigin);
+            headers.set("Referer", safeReferer.toString());
+          }
+        } catch {
+          headers.set("Referer", targetOrigin + "/");
+        }
+      }
+
+      if (isExternalRedirect) {
+        headers.delete("Authorization");
+        headers.delete("X-Emby-Authorization");
+        if (!adminCustomHeaders.has("cookie")) headers.delete("Cookie");
+        if (!adminCustomHeaders.has("origin")) headers.delete("Origin");
+        if (!adminCustomHeaders.has("referer")) headers.delete("Referer");
+      }
+
+      if (isRetry && protocolFallback) {
+        headers.delete("Authorization");
+        headers.delete("X-Emby-Authorization");
+        headers.set("Connection", "keep-alive");
+      }
+
+      if (effectiveMethod === "GET" || effectiveMethod === "HEAD") {
+        headers.delete("Content-Length");
+      }
+
+      // [预热修复] 3. 当命中预热探测时，真正命令 Cloudflare 边缘节点进行缓存
+      const fetchOptions = { 
+        method: effectiveMethod, 
+        headers, 
+        redirect: "manual", 
+        cf: isHeadPrewarm ? { cacheEverything: true, cacheTtl: prewarmCacheTtl } : { cacheEverything: false, cacheTtl: 0 } 
+      };
+      if (effectiveMethod !== "GET" && effectiveMethod !== "HEAD") {
+        if (effectiveBodyMode === "buffered" && effectiveBody !== null && effectiveBody !== undefined) fetchOptions.body = effectiveBody.slice(0);
+        else if (effectiveBodyMode === "stream") fetchOptions.body = effectiveBody;
+      }
+      return fetchOptions;
+    };
+
+    const retryableStatuses = new Set([500, 502, 503, 504, 522, 523, 524, 525, 526, 530]); 
+
+    let response;
+    let finalUrl;
+    let activeTargetBase;
+    let proxiedExternalRedirect = false;
+    let directRedirectUrl = null;
+    let directRedirectStatus = null;
+
+    try {
+      const upstream = await this.fetchUpstreamWithRetryLoop({
+        retryTargets,
+        proxyPath,
+        requestUrl,
+        buildFetchOptions,
+        retryableStatuses,
+        protocolFallback,
+        preparedBodyMode,
+        isRetry: false
+      });
+      response = upstream.response;
+      activeTargetBase = upstream.targetBase;
+      finalUrl = upstream.finalUrl;
+
+      let redirectHop = 0;
+      let redirectMethod = String(request.method || "GET").toUpperCase();
+      let redirectBodyMode = preparedBodyMode;
+      let redirectBody = preparedBody;
+      while (response.status >= 300 && response.status < 400 && redirectHop < 8) {
+        const location = response.headers.get("Location");
+        const nextUrl = resolveRedirectTarget(location, finalUrl || activeTargetBase);
+        if (!nextUrl) break;
+
+        const redirectDecision = this.evaluateRedirectDecision(nextUrl, activeTargetBase, redirectMethod, redirectBodyMode, {
+          sourceSameOriginProxy,
+          forceExternalProxy,
+          wangpanDirectKeywords,
+          currentStatus: response.status
         });
-    }
-};
 
-// ============================================================================
-// 4. UI MODULE (V17.2 Fixed)
-// ============================================================================
-const UI = {
-    getHead(title) {
-        const isLight = GLOBALS.isDaytimeCN();
-        return `<!DOCTYPE html><html class="${isLight ? 'light' : ''}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>:root{--bg:#111;--p:rgba(34,34,34,var(--bg-op,1));--b:rgba(51,51,51,var(--bg-op,1));--t:#eee;--ts:#888;--a:#22c55e;--ah:#16a34a;--e:#ef4444;--blue:#3b82f6;--blur:0px;--mask:rgba(0,0,0,0);--shadow:none;--radius:8px}html.light{--bg:#f5f5f5;--p:rgba(255,255,255,var(--bg-op,1));--b:rgba(224,224,224,var(--bg-op,1));--t:#333;--ts:#666;--a:#16a34a;--ah:#15803d}html.text-dark{--t:#111 !important;--ts:#444 !important}html.text-light{--t:#fff !important;--ts:#ccc !important}body{background:var(--bg);color:var(--t);font-family:system-ui,-apple-system,sans-serif;margin:0;display:flex;flex-direction:column;min-height:100vh;text-shadow:var(--shadow)}body::before{content:'';position:fixed;top:0;left:0;width:100%;height:100%;background:var(--mask);pointer-events:none;z-index:-1}input,button,textarea,select{transition:all .3s}.panel{background:var(--p);border:1px solid var(--b);border-radius:var(--radius);backdrop-filter:blur(var(--blur));-webkit-backdrop-filter:blur(var(--blur))}.btn{cursor:pointer;border:none;border-radius:var(--radius);font-weight:700}.btn-p{background:var(--a);color:#fff}.btn-p:hover{filter:brightness(1.1)}.btn-icon{cursor:pointer;border:none;padding:5px;background:transparent;color:var(--ts)}.btn-icon:hover{color:var(--t)}.lang-btn{cursor:pointer;padding:5px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--t)}.lang-btn:hover{background:var(--b)}.gh-icon{color:var(--ts);transition:color .3s}.gh-icon:hover{color:var(--t)}.tag-badge{font-size:10px;padding:2px 6px;border-radius:var(--radius);font-weight:bold;margin-left:6px;display:inline-block}.tag-blue{background:rgba(59,130,246,0.2);color:var(--blue)}.tag-sec{background:rgba(239,68,68,0.2);color:var(--e)}.scroll-area{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin}.scroll-area::-webkit-scrollbar{width:6px}.scroll-area::-webkit-scrollbar-thumb{background:var(--b);border-radius:3px}input[type=checkbox]:not(.toggle-input){accent-color:var(--a);cursor:pointer;width:16px;height:16px}tr.selected{background:rgba(var(--a-rgb, 34,197,94), 0.1)}.settings-btn{position:fixed;bottom:20px;left:20px;background:var(--p);border:1px solid var(--b);color:var(--t);border-radius:50%;width:40px;height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,0.2);z-index:100}.settings-modal{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--p);border:1px solid var(--b);border-radius:var(--radius);padding:20px;width:90%;max-width:400px;z-index:101;box-shadow:0 10px 30px rgba(0,0,0,0.5);display:none;max-height:85vh;overflow-y:auto}.settings-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:100;display:none}.s-group{margin-bottom:15px}.s-label{display:block;margin-bottom:5px;font-size:12px;color:var(--ts)}input[type=range]{-webkit-appearance:none;width:100%;background:transparent}input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;height:16px;width:16px;border-radius:50%;background:var(--a);cursor:pointer;margin-top:-6px;box-shadow:0 1px 3px rgba(0,0,0,0.3)}input[type=range]::-webkit-slider-runnable-track{width:100%;height:4px;cursor:pointer;background:var(--b);border-radius:2px}select, input[type=text], input[type=password]{width:100%;padding:8px;background:rgba(255,255,255,0.05);border:1px solid var(--b);color:var(--t);border-radius:var(--radius)}hr{border:0;border-top:1px solid var(--b);margin:15px 0}.switch-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding:5px 0}.switch{position:relative;display:inline-block;width:36px;height:20px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:var(--b);transition:.4s;border-radius:20px}.slider:before{position:absolute;content:"";height:14px;width:14px;left:3px;bottom:3px;background-color:#fff;transition:.4s;border-radius:50%}input:checked+.slider{background-color:var(--a)}input:checked+.slider:before{transform:translateX(16px)}.s-section{display:none;padding:12px;background:rgba(0,0,0,0.03);border-radius:var(--radius);margin-bottom:15px;border:1px solid var(--b)}.s-section.active{display:block}.color-picker-wrapper{display:flex;align-items:center;gap:10px}input[type=color]{-webkit-appearance:none;border:none;width:30px;height:30px;padding:0;overflow:hidden;border-radius:50%;cursor:pointer;background:none}input[type=color]::-webkit-color-swatch-wrapper{padding:0}input[type=color]::-webkit-color-swatch{border:1px solid var(--b);border-radius:50%}</style></head>`;
-    },
-
-    escapeHtml(unsafe) {
-        if (!unsafe) return "";
-        return String(unsafe).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
-    },
-
-    renderSmartError(request, msg, nodeName) {
-        if (request.headers.get("Accept")?.includes("text/html")) {
-            return new Response(`${this.getHead("Error")}<body><div style="display:flex;justify-content:center;align-items:center;height:100vh"><div class="panel" style="padding:40px;text-align:center"><h2>连接失败</h2><p>节点: <strong>${this.escapeHtml(nodeName)}</strong></p><p style="color:var(--e);font-family:monospace;background:var(--bg);padding:10px;border-radius:4px">${this.escapeHtml(msg)}</p><button onclick="location.reload()" class="btn btn-p" style="padding:10px 24px">重试</button></div></div></body></html>`, { status: 502, headers: { "Content-Type": "text/html;charset=utf-8" } });
+        if (redirectDecision.mustDirect) {
+          directRedirectUrl = nextUrl;
+          break;
         }
-        return new Response(JSON.stringify({ error: msg, node: nodeName }), { status: 502, headers: { "Content-Type": "application/json" } });
-    },
 
-    renderLoginPage(error = "") {
-        return new Response(`${this.getHead("Login")}<body><div style="display:flex;justify-content:center;align-items:center;height:100vh"><div class="panel" style="padding:30px;width:300px"><h3>Emby Proxy Admin</h3><form method="POST"><input type="password" name="password" placeholder="Password" style="width:100%;padding:10px;margin-bottom:15px;box-sizing:border-box" required>${error ? `<div style="color:var(--e);font-size:12px;margin-bottom:10px;text-align:center">${this.escapeHtml(error)}</div>` : ''}<button class="btn btn-p" style="width:100%;padding:10px">登 录</button></form></div></div></body></html>`, { headers: { "Content-Type": "text/html" } });
-    },
+        const nextMethod = redirectDecision.nextMethod;
+        const nextBodyMode = redirectDecision.nextBodyMode;
+        const nextBody = nextBodyMode === "none" ? null : redirectBody;
 
-    renderLockedPage(ip) {
-        return new Response(`${this.getHead("Locked")}<body><div style="display:flex;justify-content:center;align-items:center;height:100vh;text-align:center"><div><h1 style="color:var(--e)">IP 已锁定</h1><p>IP: ${this.escapeHtml(ip)}</p><p>尝试次数过多，请 15 分钟后再试。</p></div></div></body></html>`, { status: 429, headers: { "Content-Type": "text/html" } });
-    },
+        try { response.body?.cancel?.(); } catch {}
 
-    renderAdminUI() {
-        const icons = {
-            eye: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>`,
-            eyeOff: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>`,
-            trash: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>`,
-            copy: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`,
-            lock: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>`,
-            gear: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>`
-        };
+        const redirectFetchOptions = await buildFetchOptions(nextUrl, {
+          method: nextMethod,
+          bodyMode: nextBodyMode,
+          body: nextBody,
+          isExternalRedirect: !redirectDecision.isSameOriginRedirect
+        });
+        response = await fetch(nextUrl.toString(), redirectFetchOptions);
+        finalUrl = nextUrl;
+        redirectMethod = nextMethod;
+        redirectBodyMode = nextBodyMode;
+        redirectBody = nextBody;
+        if (!redirectDecision.isSameOriginRedirect) proxiedExternalRedirect = true;
+        redirectHop += 1;
+      }
 
-        const html = `
-${this.getHead("Admin")}
-<body style="padding:20px;max-width:1100px;margin:0 auto;width:100%;box-sizing:border-box">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding-bottom:15px;border-bottom:1px solid var(--b)">
-        <h2 style="margin:0">Emby Proxy <span style="font-size:12px;color:var(--ts);font-weight:normal">V17.6</span></h2>
-        <div style="display:flex;align-items:center;gap:15px">
-             <div id="clk" style="font-family:monospace;font-size:12px;color:var(--ts)"></div>
-             <div class="lang-btn" onclick="App.toggleLang()" title="Switch Language">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1 4-10z"></path></svg>
-             </div>
-        </div>
-    </div>
-    
-    <div style="display:grid;grid-template-columns:1fr 2.5fr;gap:20px;flex:1;min-height:0" class="grid-box">
-        <style>@media(max-width:768px){.grid-box{grid-template-columns:1fr !important}}</style>
-        
-        <div class="panel" style="padding:20px;height:fit-content">
-            <h3 style="margin-top:0" id="t-new">New Node</h3>
-            
-            <div style="margin-bottom:10px">
-                <label style="display:block;font-size:12px;color:var(--ts);margin-bottom:4px" id="l-name">Name</label>
-                <input id="inName" style="width:100%">
-            </div>
-            
-            <div style="margin-bottom:10px">
-                <label style="display:block;font-size:12px;color:var(--ts);margin-bottom:4px" id="l-tag">Tag</label>
-                <input id="inTag" style="width:100%">
-            </div>
-            
-            <div style="margin-bottom:10px">
-                <label style="display:block;font-size:12px;color:var(--ts);margin-bottom:4px" id="l-target">Target</label>
-                <input id="inTarget" style="width:100%">
-            </div>
-            
-            <div style="margin-bottom:15px">
-                <label style="display:block;font-size:12px;color:var(--ts);margin-bottom:4px" id="l-sec">Secret Path</label>
-                <input id="inSec" style="width:100%">
-            </div>
+      if (!directRedirectUrl && nodeDirectSource && response.status >= 200 && response.status < 300 && (request.method === "GET" || request.method === "HEAD")) {
+        directRedirectUrl = new URL(proxyPath, activeTargetBase);
+        directRedirectUrl.search = requestUrl.search;
+        directRedirectStatus = 307;
+        try { response.body?.cancel?.(); } catch {}
+      }
 
-            <button class="btn btn-p" onclick="App.save()" style="width:100%;padding:8px" id="t-deploy">Deploy</button>
-        </div>
+      const modifiedHeaders = this.buildProxyResponseHeaders(response, request, dynamicCors, finalOrigin, requestTraits, {
+        enableH3,
+        forceH1,
+        proxiedExternalRedirect
+      });
+      this.applyProxyRedirectHeaders(modifiedHeaders, response, activeTargetBase, name, key, directRedirectUrl);
 
-        <div class="panel" style="padding:20px;display:flex;flex-direction:column;min-height:0">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:10px">
-                <div style="display:flex;align-items:center;gap:10px;flex:1">
-                    <h3 style="margin:0;white-space:nowrap" id="t-nodes">Nodes</h3>
-                    <input id="inSearch" oninput="App.filter(this.value)" placeholder="Search Name or Tag..." style="padding:5px 10px;background:var(--bg);border:1px solid var(--b);color:var(--t);border-radius:15px;font-size:12px;width:100%;max-width:200px">
-                </div>
-                <div style="display:flex;align-items:center;gap:5px">
-                    <button onclick="App.toggleAllTargets()" class="btn btn-icon" id="btn-eye-all" title="Toggle All Targets">${icons.eye}</button>
-                    <div style="width:1px;height:20px;background:var(--b);margin:0 5px"></div>
-                    <button onclick="App.export()" class="btn" style="background:var(--b);color:var(--t);padding:4px 8px;font-size:12px" id="t-export">Export</button>
-                    <button onclick="document.getElementById('fIn').click()" class="btn" style="background:var(--b);color:var(--t);padding:4px 8px;font-size:12px" id="t-import">Import</button>
-                    <input type="file" id="fIn" hidden accept=".json" onchange="App.import(this)">
-                </div>
-            </div>
+      const reqCategory = this.classifyProxyLogCategory(requestTraits);
+      const errorDetail = this.extractProxyErrorDetail(response);
 
-            <div id="batch-bar" style="display:none;align-items:center;gap:10px;background:var(--bg);padding:8px;border-radius:4px;margin-bottom:10px;border:1px dashed var(--b)">
-                <span style="font-size:12px;color:var(--ts)" id="t-selected">Selected: 0</span>
-                <button onclick="App.batchDelete()" class="btn" style="color:var(--e);font-size:12px;padding:2px 8px;border:1px solid var(--e);background:transparent" id="t-batchDel">Delete Selected</button>
-                <button onclick="App.batchTag()" class="btn" style="color:var(--blue);font-size:12px;padding:2px 8px;border:1px solid var(--blue);background:transparent" id="t-batchTag">Set Tag</button>
-            </div>
+      Logger.record(env, ctx, {
+        nodeName: name,
+        requestPath: proxyPath,
+        requestMethod: request.method,
+        statusCode: response.status,
+        responseTime: Date.now() - startTime,
+        clientIp,
+        userAgent: request.headers.get("User-Agent"),
+        referer: request.headers.get("Referer"),
+        category: reqCategory,
+        errorDetail: errorDetail // [新增]
+      });
 
-            <div class="scroll-area">
-                <table style="width:100%;border-collapse:collapse;font-size:13px">
-                    <thead style="position:sticky;top:0;background:var(--p);z-index:10;box-shadow:0 1px 0 var(--b)">
-                        <tr>
-                            <th style="text-align:left;padding:10px;border-bottom:1px solid var(--b);width:30px">
-                                <input type="checkbox" onchange="App.toggleSelectAll(this)">
-                            </th>
-                            <th style="text-align:left;padding:10px;border-bottom:1px solid var(--b)" id="th-name">Name</th>
-                            <th style="text-align:left;padding:10px;border-bottom:1px solid var(--b)" id="th-target">Target</th>
-                            <th style="text-align:left;padding:10px;border-bottom:1px solid var(--b)" id="th-proxy">Proxy</th>
-                            <th style="text-align:right;padding:10px;border-bottom:1px solid var(--b)" id="th-action">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="list"></tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-    
-    <div class="settings-btn" onclick="App.toggleSettings()">${icons.gear}</div>
-    <div class="settings-overlay" onclick="App.toggleSettings()"></div>
-    <div class="settings-modal">
-        <h3 style="margin-top:0">Personalization / 个性化</h3>
-        
-        <div class="s-group">
-            <label class="s-label">Theme Preset / 预设主题</label>
-            <select id="s-preset" onchange="App.applyPreset(this.value)">
-                <option value="custom">Custom / 自定义</option>
-                <option value="white">Minimal White / 极简白</option>
-                <option value="black">Pure Black / 纯粹黑</option>
-                <option value="ocean">Ocean Blue / 海洋蓝</option>
-                <option value="purple">Neon Purple / 霓虹紫</option>
-                <option value="orange">Sunset Gold / 落日金</option>
-            </select>
-        </div>
-        
-        <div class="switch-row">
-            <span class="s-label" style="margin:0">Background Image / 背景图片 <span style="font-weight:normal;color:var(--e)">(Required for Blur)</span></span>
-            <label class="switch"><input type="checkbox" id="sw-bg" onchange="App.toggleSection('bg')"><span class="slider"></span></label>
-        </div>
-        <div id="sec-bg" class="s-section">
-            <input id="s-bg-url" placeholder="Image URL (https://...)" style="margin-bottom:5px" oninput="App.previewStyle()">
-            <div style="display:flex;gap:10px">
-                 <input type="file" id="s-bg-file" accept="image/*" style="font-size:12px;color:var(--ts);flex:1">
-                 <button onclick="App.clearBackground()" class="btn" style="background:#ef4444;color:#fff;padding:4px 8px;font-size:12px;border-radius:4px">Clear</button>
-            </div>
-        </div>
 
-        <div class="switch-row">
-            <span class="s-label" style="margin:0">UI Style / 界面风格</span>
-            <label class="switch"><input type="checkbox" id="sw-ui" onchange="App.toggleSection('ui')"><span class="slider"></span></label>
-        </div>
-        <div id="sec-ui" class="s-section">
-            <div class="s-group color-picker-wrapper">
-                <label class="s-label" style="margin:0;flex:1">Accent Color / 主题色</label>
-                <input type="color" id="s-accent" value="#22c55e" oninput="App.previewStyle()">
-            </div>
-            <div class="s-group" style="margin-bottom:0">
-                <label class="s-label">Border Radius / 圆角: <span id="s-radius-val">8px</span></label>
-                <input type="range" id="s-radius" min="0" max="20" step="1" value="8" oninput="App.previewStyle()">
-            </div>
-        </div>
-
-        <div class="switch-row">
-            <span class="s-label" style="margin:0">Glass Effect / 毛玻璃特效</span>
-            <label class="switch"><input type="checkbox" id="sw-glass" onchange="App.toggleSection('glass')"><span class="slider"></span></label>
-        </div>
-        <div id="sec-glass" class="s-section">
-            <div class="s-group">
-                <label class="s-label">Opacity / 透明度: <span id="s-opacity-val">0.9</span></label>
-                <input type="range" id="s-opacity" min="0.1" max="1" step="0.05" value="0.9" oninput="App.previewStyle()">
-            </div>
-            <div class="s-group" style="margin-bottom:0">
-                <label class="s-label">Blur Radius / 模糊程度: <span id="s-blur-val">0px</span></label>
-                <input type="range" id="s-blur" min="0" max="20" step="1" value="0" oninput="App.previewStyle()">
-            </div>
-        </div>
-        
-        <div class="switch-row">
-            <span class="s-label" style="margin:0">Background Mask / 背景遮罩</span>
-            <label class="switch"><input type="checkbox" id="sw-mask" onchange="App.toggleSection('mask')"><span class="slider"></span></label>
-        </div>
-        <div id="sec-mask" class="s-section">
-            <div class="s-group" style="margin-bottom:0">
-                <label class="s-label">Darken or Lighten: <span id="s-mask-val">0</span></label>
-                <input type="range" id="s-mask" min="-0.8" max="0.8" step="0.1" value="0" oninput="App.previewStyle()">
-                <div style="font-size:10px;color:var(--ts);display:flex;justify-content:space-between"><span>Black</span><span>None</span><span>White</span></div>
-            </div>
-        </div>
-
-        <div class="switch-row">
-            <span class="s-label" style="margin:0">Theme & Custom CSS / 主题与样式</span>
-            <label class="switch"><input type="checkbox" id="sw-text" onchange="App.toggleSection('text')"><span class="slider"></span></label>
-        </div>
-        <div id="sec-text" class="s-section">
-            <div class="s-group">
-                <label class="s-label">Theme Mode / 主题模式</label>
-                <select id="s-theme-mode" onchange="App.previewStyle()">
-                    <option value="auto">Auto</option>
-                    <option value="light">Light / 浅色</option>
-                    <option value="dark">Dark / 深色</option>
-                </select>
-            </div>
-            <div class="s-group" style="margin-bottom:0">
-                <label class="s-label">Custom CSS</label>
-                <textarea id="s-css" placeholder="body { ... }" rows="3" style="width:100%;padding:8px;font-family:monospace;margin-top:5px" oninput="App.previewStyle()"></textarea>
-            </div>
-        </div>
-
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:20px;border-top:1px solid var(--b);padding-top:15px">
-            <button onclick="App.resetAppearance()" class="btn" style="background:transparent;color:var(--ts);font-size:12px;border:1px dashed var(--ts)">Default / 恢复</button>
-            <button onclick="App.saveSettings()" class="btn btn-p" style="padding:8px 24px">Save</button>
-        </div>
-    </div>
-
-    <div style="margin-top:20px;padding:20px;text-align:center;border-top:1px solid var(--b)">
-        <a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" title="GitHub Repository" style="display:inline-block">
-            <svg class="gh-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
-        </a>
-    </div>
-
-    <script>
-        const $=(s)=>document.querySelector(s);
-        const API={req:async(d)=>{const r=await fetch('/admin',{method:'POST',body:JSON.stringify(d)});if(r.status===401)location.reload();return r.json()}};
-        const Icons = {
-            eye: '${icons.eye}', eyeOff: '${icons.eyeOff}', trash: '${icons.trash}', copy: '${icons.copy}', lock: '${icons.lock}'
-        };
-
-        const PRESETS = {
-            white: { color: '#000000', bg: '', radius: 8, mode: 'light' },
-            black: { color: '#ffffff', bg: '', radius: 8, mode: 'dark' },
-            ocean: { color: '#06b6d4', bg: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1920&q=80', radius: 12, mode: 'light' },
-            purple: { color: '#d946ef', bg: 'https://images.unsplash.com/photo-1563089145-599997674d42?auto=format&fit=crop&w=1920&q=80', radius: 4, mode: 'dark' },
-            orange: { color: '#f59e0b', bg: 'https://images.unsplash.com/photo-1470252649378-9c29740c9fa8?auto=format&fit=crop&w=1920&q=80', radius: 20, mode: 'dark' }
-        };
-
-        const TEXTS = {
-            'en': {
-                new: "New Node", namePh: "e.g. HK", targetPh: "http://1.2.3.4:8096",
-                tagPh: "e.g. VIP", secPh: "Optional", deploy: "Deploy", nodes: "Nodes",
-                export: "Export", import: "Import", noNodes: "No nodes", copy: "Copied!", copied: "Copied!", del: "Del",
-                search: "Search Name or Tag...", batchDel: "Delete Selected", batchTag: "Set Tag", selected: "Selected: ",
-                thName: "Name", thTarget: "Target", thProxy: "Proxy", thAction: "Action", inputTag: "Enter Tag Name:",
-                lName: "Name", lTag: "Tag", lTarget: "Target Address", lSec: "Secret Path"
-            },
-            'zh-Hans': {
-                new: "新建节点", namePh: "例如 HK", targetPh: "http://1.2.3.4:8096",
-                tagPh: "例如 VIP", secPh: "可选", deploy: "部署", nodes: "节点列表",
-                export: "导出配置", import: "导入配置", noNodes: "暂无节点", copy: "已复制!", copied: "已复制!", del: "删除",
-                search: "搜索名称或标签...", batchDel: "批量删除", batchTag: "批量设置标签", selected: "已选: ",
-                thName: "名称", thTarget: "目标", thProxy: "代理地址", thAction: "操作", inputTag: "输入标签名称:",
-                lName: "名称", lTag: "标签", lTarget: "目标地址", lSec: "私密路径"
-            },
-            'zh-Hant': {
-                new: "新建節點", namePh: "例如 HK", targetPh: "http://1.2.3.4:8096",
-                tagPh: "例如 VIP", secPh: "可選", deploy: "部署", nodes: "節點列表",
-                export: "導出配置", import: "導入配置", noNodes: "暫無節點", copy: "已複製!", copied: "已複製!", del: "刪除",
-                search: "搜索名稱或標籤...", batchDel: "批量刪除", batchTag: "批量設置標籤", selected: "已選: ",
-                thName: "名稱", thTarget: "目標", thProxy: "代理地址", thAction: "操作", inputTag: "輸入標籤名稱:",
-                lName: "名稱", lTag: "標籤", lTarget: "目標地址", lSec: "私密路徑"
-            }
-        };
-
-        const App={
-            nodes:[],
-            config: {},
-            lang: 'en',
-            showAllTargets: false,
-            selected: new Set(),
-            filterText: '',
-            visibleMap: new Set(), 
-
-            async init(){
-                const nav = navigator.language.toLowerCase();
-                if (nav.includes('tw') || nav.includes('hk')) this.lang = 'zh-Hant';
-                else if (nav.includes('zh')) this.lang = 'zh-Hans';
-                else this.lang = 'en';
-
-                this.updateTexts();
-                
-                const cfg = await API.req({action:'loadConfig'});
-                if(cfg) {
-                    this.config = cfg;
-                    this.applyConfig(this.config);
+      // [预热进阶] 命中预热探测时，旁路预取后续一段 Range（只对视频路由生效），用于温后续分段/Range
+      // - 依赖 ctx.waitUntil，不影响主请求返回
+      // - 仅在源站支持 Range（206 或 Content-Range）时执行，避免误触发全量下载
+      // - 使用 X-Prewarm-Prefetch=1 防止递归/回环
+      if (
+        isHeadPrewarm &&
+        looksLikeVideoRoute &&
+        !isManifest &&
+        !isSegment &&
+        prewarmPrefetchBytes > 0 &&
+        ctx &&
+        request.headers.get("X-Prewarm-Prefetch") !== "1"
+      ) {
+        const contentRange = response.headers.get("Content-Range");
+        const isPartial = response.status === 206 || !!contentRange;
+        if (isPartial) {
+          ctx.waitUntil(
+            (async () => {
+              try {
+                // 解析原始探测 Range：bytes=0- / bytes=0-0 / bytes=0-1 / bytes=0-xxxxx
+                const m = /^bytes=0-(\d{0,7})?$/.exec(rangeHeader || "");
+                let nextStart = 0;
+                if (m && m[1] && m[1].length > 0) {
+                  const endNum = parseInt(m[1], 10);
+                  if (!Number.isNaN(endNum)) nextStart = endNum + 1;
                 }
 
-                await this.refresh();
-                setInterval(()=>$('#clk').innerText=new Date().toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai'}),1000);
-            },
-            
-            toggleSettings() {
-                const d = $('.settings-modal').style.display;
-                const show = d === 'block' ? 'none' : 'block';
-                $('.settings-modal').style.display = show;
-                $('.settings-overlay').style.display = show;
-                
-                if(show === 'block') {
-                    const c = this.config;
-                    
-                    const hasBg = !!(c.bgUrl || c.bgImage);
-                    const hasGlass = (c.panelOpacity !== undefined && c.panelOpacity < 1) || (c.panelBlur !== undefined && c.panelBlur > 0);
-                    const hasMask = (c.bgMask !== undefined && c.bgMask !== 0);
-                    const hasText = !!(c.customCss || (c.themeMode && c.themeMode !== 'auto'));
-                    const hasUi = !!(c.accentColor || c.borderRadius !== undefined);
+                const prefetchStart = nextStart;
+                const prefetchEnd = prefetchStart + prewarmPrefetchBytes - 1;
+                if (prefetchEnd < prefetchStart) return;
 
-                    $('#sw-bg').checked = hasBg;
-                    $('#sw-glass').checked = hasGlass;
-                    $('#sw-mask').checked = hasMask;
-                    $('#sw-text').checked = hasText;
-                    $('#sw-ui').checked = hasUi;
+                const prefetchRange = `bytes=${prefetchStart}-${prefetchEnd}`;
+                const prefetchOptions = await buildFetchOptions(finalUrl, { method: "GET" });
+                prefetchOptions.headers.set("Range", prefetchRange);
+                // 去掉可能影响缓存/命中的条件请求头
+                prefetchOptions.headers.delete("If-Modified-Since");
+                prefetchOptions.headers.delete("If-None-Match");
+                prefetchOptions.headers.set("X-Prewarm-Prefetch", "1");
 
-                    $('#s-bg-url').value = c.bgUrl || '';
-                    $('#s-css').value = c.customCss || '';
-                    
-                    $('#s-opacity').value = c.panelOpacity !== undefined ? c.panelOpacity : 0.9;
-                    $('#s-opacity-val').innerText = $('#s-opacity').value;
-                    
-                    $('#s-blur').value = c.panelBlur !== undefined ? c.panelBlur : 0;
-                    $('#s-blur-val').innerText = $('#s-blur').value + 'px';
-                    
-                    $('#s-mask').value = c.bgMask !== undefined ? c.bgMask : 0;
-                    $('#s-mask-val').innerText = $('#s-mask').value;
-
-                    $('#s-theme-mode').value = c.themeMode || 'auto';
-                    
-                    $('#s-accent').value = c.accentColor || '#22c55e';
-                    $('#s-radius').value = c.borderRadius !== undefined ? c.borderRadius : 8;
-                    $('#s-radius-val').innerText = $('#s-radius').value + 'px';
-
-                    this.toggleSection('bg', true);
-                    this.toggleSection('glass', true);
-                    this.toggleSection('mask', true);
-                    this.toggleSection('text', true);
-                    this.toggleSection('ui', true);
-                }
-            },
-
-            toggleSection(id, noPreview) {
-                const checked = $('#sw-' + id).checked;
-                const el = $('#sec-' + id);
-                if(checked) {
-                    el.classList.add('active');
-                    if(id === 'glass' && !noPreview) {
-                        if($('#s-opacity').value == 1) $('#s-opacity').value = 0.8; 
-                        if($('#s-blur').value == 0) $('#s-blur').value = 10;
-                    }
-                } else {
-                    el.classList.remove('active');
-                }
-                if(!noPreview) this.previewStyle();
-            },
-
-            applyPreset(name) {
-                if (name === 'custom') return;
-                const p = PRESETS[name];
-                if (!p) return;
-
-                $('#sw-ui').checked = true;
-                this.toggleSection('ui', true);
-                $('#s-accent').value = p.color;
-                $('#s-radius').value = p.radius;
-                $('#s-radius-val').innerText = p.radius + 'px';
-
-                if (p.mode) {
-                     $('#sw-text').checked = true;
-                     this.toggleSection('text', true);
-                     $('#s-theme-mode').value = p.mode;
-                }
-
-                if (p.bg) {
-                    $('#sw-bg').checked = true;
-                    this.toggleSection('bg', true);
-                    $('#s-bg-url').value = p.bg;
-                    $('#s-bg-file').value = '';
-                } else {
-                    $('#sw-bg').checked = false;
-                    this.toggleSection('bg', true);
-                }
-
-                this.previewStyle();
-            },
-
-            previewStyle() {
-                const useBg = $('#sw-bg').checked;
-                const useGlass = $('#sw-glass').checked;
-                const useMask = $('#sw-mask').checked;
-                const useText = $('#sw-text').checked;
-                const useUi = $('#sw-ui').checked;
-
-                const tempConfig = {
-                    bgUrl: useBg ? $('#s-bg-url').value : null,
-                    bgImage: useBg ? (this.config.bgImage || null) : null, 
-                    panelOpacity: useGlass ? $('#s-opacity').value : 1,
-                    panelBlur: useGlass ? $('#s-blur').value : 0,
-                    bgMask: useMask ? $('#s-mask').value : 0,
-                    customCss: useText ? $('#s-css').value : null,
-                    themeMode: useText ? $('#s-theme-mode').value : 'auto',
-                    accentColor: useUi ? $('#s-accent').value : '#22c55e',
-                    borderRadius: useUi ? $('#s-radius').value : 8
-                };
-                
-                $('#s-opacity-val').innerText = tempConfig.panelOpacity;
-                $('#s-blur-val').innerText = tempConfig.panelBlur + 'px';
-                $('#s-mask-val').innerText = tempConfig.bgMask;
-                $('#s-radius-val').innerText = tempConfig.borderRadius + 'px';
-                
-                this.applyConfig(tempConfig);
-            },
-
-            applyConfig(c) {
-                let css = '';
-                if (c.bgUrl || c.bgImage) {
-                     let bg = c.bgImage || c.bgUrl;
-                     css += \`body { background: url('\${bg}') no-repeat center center fixed; background-size: cover; }\`;
-                } else {
-                    css += \`body { background: var(--bg); }\`;
-                }
-                
-                const op = c.panelOpacity !== undefined ? c.panelOpacity : 1; 
-                const bl = c.panelBlur !== undefined ? c.panelBlur : 0;
-                const rad = c.borderRadius !== undefined ? c.borderRadius : 8;
-                const acc = c.accentColor || '#22c55e';
-                
-                let maskVal = c.bgMask !== undefined ? parseFloat(c.bgMask) : 0;
-                let maskColor = '0,0,0';
-                if(maskVal > 0) maskColor = '255,255,255';
-                let maskAlpha = Math.abs(maskVal);
-                
-                document.documentElement.style.setProperty('--bg-op', op);
-                document.documentElement.style.setProperty('--blur', bl + 'px');
-                document.documentElement.style.setProperty('--mask', \`rgba(\${maskColor}, \${maskAlpha})\`);
-                document.documentElement.style.setProperty('--radius', rad + 'px');
-                document.documentElement.style.setProperty('--a', acc);
-                
-                const hex = acc.replace('#','');
-                if(hex.length === 6) {
-                    const r = parseInt(hex.substring(0,2), 16);
-                    const g = parseInt(hex.substring(2,4), 16);
-                    const b = parseInt(hex.substring(4,6), 16);
-                    document.documentElement.style.setProperty('--a-rgb', \`\${r},\${g},\${b}\`);
-                }
-
-                const mode = c.themeMode || 'auto';
-                if (mode === 'light') {
-                    document.documentElement.classList.add('light');
-                } else if (mode === 'dark') {
-                    document.documentElement.classList.remove('light');
-                } else {
-                    const h = (new Date().getUTCHours() + 8) % 24;
-                    if(h >= 6 && h < 18) document.documentElement.classList.add('light');
-                    else document.documentElement.classList.remove('light');
-                }
-
-                if (c.customCss) css += c.customCss;
-                
-                let style = $('#custom-style');
-                if (!style) {
-                    style = document.createElement('style');
-                    style.id = 'custom-style';
-                    document.head.appendChild(style);
-                }
-                style.innerHTML = css;
-            },
-
-            async clearBackground() {
-                if(!confirm("Clear Background Image?")) return;
-                this.config.bgImage = null;
-                this.config.bgUrl = null;
-                $('#s-bg-url').value = '';
-                $('#s-bg-file').value = '';
-                this.previewStyle();
-            },
-
-            async resetAppearance() {
-                if(!confirm("Reset all appearance settings?")) return;
-                const newConfig = { 
-                    bgUrl: null, bgImage: null, customCss: null,
-                    panelOpacity: 1, panelBlur: 0, bgMask: 0,
-                    themeMode: 'auto', accentColor: '#22c55e', borderRadius: 8
-                };
-                await API.req({ action: 'saveConfig', config: newConfig });
-                location.reload();
-            },
-
-            async saveSettings() {
-                const useBg = $('#sw-bg').checked;
-                const useGlass = $('#sw-glass').checked;
-                const useMask = $('#sw-mask').checked;
-                const useText = $('#sw-text').checked;
-                const useUi = $('#sw-ui').checked;
-
-                const bgUrl = $('#s-bg-url').value;
-                const file = $('#s-bg-file').files[0];
-                let bgImage = this.config.bgImage;
-
-                if (useBg && file) {
-                    if (!file.type.startsWith('image/')) return alert('Images only');
-                    if (file.size > 2 * 1024 * 1024) return alert('Max size 2MB');
-                    bgImage = await new Promise(r => {
-                        const reader = new FileReader();
-                        reader.onload = e => r(e.target.result);
-                        reader.readAsDataURL(file);
-                    });
-                } else if (!useBg) {
-                    bgImage = null;
-                }
-
-                const newConfig = { 
-                    bgUrl: useBg ? bgUrl : null, 
-                    bgImage: useBg ? bgImage : null, 
-                    panelOpacity: useGlass ? $('#s-opacity').value : 1, 
-                    panelBlur: useGlass ? $('#s-blur').value : 0,
-                    bgMask: useMask ? $('#s-mask').value : 0,
-                    themeMode: useText ? $('#s-theme-mode').value : 'auto',
-                    customCss: useText ? $('#s-css').value : null,
-                    accentColor: useUi ? $('#s-accent').value : '#22c55e',
-                    borderRadius: useUi ? $('#s-radius').value : 8
-                };
-                
-                await API.req({ action: 'saveConfig', config: newConfig });
-                this.config = newConfig;
-                this.applyConfig(this.config);
-                this.toggleSettings();
-            },
-
-            toggleLang() {
-                if (this.lang === 'en') this.lang = 'zh-Hans';
-                else if (this.lang === 'zh-Hans') this.lang = 'zh-Hant';
-                else this.lang = 'en';
-                this.updateTexts();
-                this.renderList();
-            },
-            
-            updateTexts() {
-                const t = TEXTS[this.lang];
-                $('#t-new').innerText = t.new;
-                $('#l-name').innerText = t.lName; $('#inName').placeholder = t.namePh;
-                $('#l-target').innerText = t.lTarget; $('#inTarget').placeholder = t.targetPh;
-                $('#l-tag').innerText = t.lTag; $('#inTag').placeholder = t.tagPh;
-                $('#l-sec').innerText = t.lSec; $('#inSec').placeholder = t.secPh;
-                
-                $('#t-deploy').innerText = t.deploy;
-                $('#t-nodes').innerText = t.nodes;
-                $('#t-export').innerText = t.export;
-                $('#t-import').innerText = t.import;
-                $('#inSearch').placeholder = t.search;
-                $('#t-batchDel').innerText = t.batchDel;
-                $('#t-batchTag').innerText = t.batchTag;
-                $('#th-name').innerText = t.thName;
-                $('#th-target').innerText = t.thTarget;
-                $('#th-proxy').innerText = t.thProxy;
-                $('#th-action').innerText = t.thAction;
-            },
-
-            async refresh(){
+                const prefetchRes = await fetch(finalUrl.toString(), prefetchOptions);
                 try {
-                    const d=await API.req({action:'list'});
-                    if(d.error) {
-                        alert('错误：' + d.error);
-                        return;
-                    }
-                    this.nodes=(d.nodes || []).map(n => ({...n, tag: n.tag || ""})); 
-                    this.selected.clear();
-                    this.renderList();
-                } catch(e) {
-                    alert('前端加载失败：' + e);
-                }
-            },
-            
-            filter(val) {
-                this.filterText = val.toLowerCase();
-                this.renderList();
-            },
+                  if (prefetchRes.body) {
+                    // 将数据流直接导入黑洞，触发 CF 边缘缓存但完全不占用 Worker 内存
+                    await prefetchRes.body.pipeTo(new WritableStream({ write() {} }));
+                  }
+                } catch {}
+              } catch {}
+            })()
+          );
+        }
+      }
 
-            toggleAllTargets() {
-                this.showAllTargets = !this.showAllTargets;
-                const btn = $('#btn-eye-all');
-                btn.innerHTML = this.showAllTargets ? Icons.eyeOff : Icons.eye;
-                btn.style.color = this.showAllTargets ? 'var(--a)' : 'var(--ts)';
-                this.renderList();
-            },
+      const finalStatus = directRedirectStatus || response.status;
+      const finalStatusText = directRedirectStatus ? "Temporary Redirect" : response.statusText;
+      if (!directRedirectStatus && response.status === 101 && response.webSocket) {
+        return new Response(null, {
+          status: 101,
+          statusText: response.statusText,
+          headers: modifiedHeaders,
+          webSocket: response.webSocket
+        });
+      }
+      return new Response(directRedirectStatus ? null : response.body, {
+        status: finalStatus,
+        statusText: finalStatusText,
+        headers: modifiedHeaders
+      });
 
-            toggleVisibility(key) {
-                if (this.visibleMap.has(key)) this.visibleMap.delete(key);
-                else this.visibleMap.add(key);
-                this.renderList();
-            },
+    } catch (err) {
+      Logger.record(env, ctx, {
+        nodeName: name,
+        requestPath: proxyPath,
+        requestMethod: request.method,
+        statusCode: 502,
+        responseTime: Date.now() - startTime,
+        clientIp,
+        category: "error",
+        errorDetail: err.message || "网关或 CF Workers 内部崩溃" // [新增]
+      });
 
-            toggleSelect(name) {
-                if (this.selected.has(name)) this.selected.delete(name);
-                else this.selected.add(name);
-                this.renderBatchBar();
-                const row = document.getElementById('row-'+name);
-                if(row) {
-                    if(this.selected.has(name)) row.classList.add('selected');
-                    else row.classList.remove('selected');
-                }
-            },
+      const errHeaders = new Headers({
+        "Content-Type": "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin": finalOrigin || "*",
+        "Cache-Control": "no-store"
+      });
 
-            toggleSelectAll(cb) {
-                const visibleNodes = this.getFilteredNodes();
-                if (cb.checked) visibleNodes.forEach(n => this.selected.add(n.name));
-                else this.selected.clear();
-                this.renderList();
-            },
+      if (finalOrigin !== "*") mergeVaryHeader(errHeaders, "Origin");
+      applySecurityHeaders(errHeaders);
 
-            getFilteredNodes() {
-                if (!this.filterText) return this.nodes;
-                return this.nodes.filter(n => 
-                    n.name.toLowerCase().includes(this.filterText) || 
-                    (n.tag && n.tag.toLowerCase().includes(this.filterText))
-                );
-            },
-
-            renderBatchBar() {
-                const bar = $('#batch-bar');
-                const t = TEXTS[this.lang];
-                if (this.selected.size > 0) {
-                    bar.style.display = 'flex';
-                    $('#t-selected').innerText = t.selected + this.selected.size;
-                } else {
-                    bar.style.display = 'none';
-                }
-            },
-            
-            // 修复: 在 App 对象内补充 escapeHtml 函数
-            escapeHtml(unsafe) {
-                if (!unsafe) return "";
-                return String(unsafe).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
-            },
-
-            renderList() {
-                const t = TEXTS[this.lang];
-                const displayNodes = this.getFilteredNodes();
-                const allSelected = displayNodes.length > 0 && displayNodes.every(n => this.selected.has(n.name));
-                
-                const selectAllCb = $('thead input[type=checkbox]');
-                if(selectAllCb) selectAllCb.checked = allSelected;
-
-                $('#list').innerHTML = displayNodes.map(n => {
-                    const isSel = this.selected.has(n.name);
-                    const safeName = this.escapeHtml(n.name); // 之前这里报错，因为 this.escapeHtml 不存在
-                    const safeTag = this.escapeHtml(n.tag);
-                    const safeTarget = this.escapeHtml(n.target);
-                    const safeSecret = this.escapeHtml(n.secret);
-
-                    // ========================================================
-                    // 核心逻辑：动态计算 Proxy 地址（无 KV 存储）
-                    // ========================================================
-                    const proxyUrl = location.origin + '/' + safeName + (n.secret ? '/' + safeSecret : '');
-
-                    // Keys for individual visibility
-                    const kTarget = safeName + ':target';
-                    const kProxy = safeName + ':proxy';
-                    
-                    const showTarget = this.showAllTargets || this.visibleMap.has(kTarget);
-                    const showProxy = this.showAllTargets || this.visibleMap.has(kProxy);
-
-                    const tagHtml = n.tag ? \`<span class="tag-badge tag-blue">\${safeTag}</span>\` : '';
-                    const secHtml = n.secret ? \`<span title="Secret" style="margin-left:5px;color:var(--d97706)">\${Icons.lock}</span>\` : '';
-                    
-                    const targetDisplay = showTarget ? safeTarget : '••••••••••••';
-                    const targetClass = showTarget ? '' : 'color:var(--ts);letter-spacing:2px';
-                    
-                    const proxyDisplay = showProxy ? proxyUrl : '••••••••••••';
-                    const proxyClass = showProxy ? '' : 'color:var(--ts);letter-spacing:2px';
-
-                    return \`<tr id="row-\${safeName}" class="\${isSel?'selected':''}" style="border-bottom:1px solid var(--b)">
-                        <td style="padding:10px">
-                            <input type="checkbox" \${isSel?'checked':''} onchange="App.toggleSelect('\${safeName}')">
-                        </td>
-                        <td style="padding:10px">
-                            <div style="display:flex;align-items:center">
-                                <b style="cursor:pointer" onclick="App.copyText('\${safeName}', this)">\${safeName}</b>
-                                \${tagHtml}
-                                \${secHtml}
-                            </div>
-                        </td>
-                        <td style="padding:10px;font-family:monospace;font-size:12px;\${targetClass}">
-                            <div style="display:flex;align-items:center;gap:5px">
-                                <span style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle">\${targetDisplay}</span>
-                                <button onclick="App.toggleVisibility('\${kTarget}')" class="btn-icon" style="padding:0;transform:scale(0.8)">\${showTarget ? Icons.eyeOff : Icons.eye}</button>
-                            </div>
-                        </td>
-                        <td style="padding:10px;font-family:monospace;font-size:12px;\${proxyClass}">
-                            <div style="display:flex;align-items:center;gap:5px">
-                                <span style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle">\${proxyDisplay}</span>
-                                <button onclick="App.toggleVisibility('\${kProxy}')" class="btn-icon" style="padding:0;transform:scale(0.8)">\${showProxy ? Icons.eyeOff : Icons.eye}</button>
-                            </div>
-                        </td>
-                        <td style="padding:10px;text-align:right">
-                             <button onclick="App.copyText('\${proxyUrl}', this)" class="btn-icon" title="Copy Proxy Address">\${Icons.copy}</button>
-                             <button onclick="App.del('\${safeName}')" class="btn-icon" style="color:var(--e)" title="Delete">\${Icons.trash}</button>
-                        </td>
-                    </tr>\`;
-                }).join('') || \`<tr><td colspan="5" style="padding:20px;text-align:center;color:var(--ts)">\${t.noNodes}</td></tr>\`;
-                
-                this.renderBatchBar();
-            },
-
-            async save(){
-                const name=$('#inName').value, target=$('#inTarget').value, secret=$('#inSec').value, tag=$('#inTag').value;
-                if(!name||!target) return alert('Required');
-                await API.req({action:'save',name,target,secret,tag});
-                $('#inName').value=''; $('#inTarget').value=''; $('#inSec').value=''; $('#inTag').value='';
-                this.refresh();
-            },
-
-            async del(n){if(confirm('Delete '+n+'?')){await API.req({action:'delete',name:n});this.refresh()}},
-            
-            async batchDelete() {
-                if(!confirm('Delete ' + this.selected.size + ' items?')) return;
-                await API.req({action:'batchDelete', names: Array.from(this.selected)});
-                this.refresh();
-            },
-
-            async batchTag() {
-                const tag = prompt(TEXTS[this.lang].inputTag);
-                if (tag === null) return;
-                const updates = [];
-                for(const name of this.selected) {
-                    const node = this.nodes.find(n => n.name === name);
-                    if(node) updates.push({...node, tag: tag});
-                }
-                await API.req({action:'import', nodes: updates});
-                this.refresh();
-            },
-
-            async export(){
-                const a=document.createElement('a');
-                a.href=URL.createObjectURL(new Blob([JSON.stringify(this.nodes)],{type:'json'}));
-                a.download='nodes_v17.json';
-                a.click();
-            },
-
-            async import(e){
-                const f=e.files[0]; if(!f) return;
-                const r=new FileReader();
-                r.onload=async ev=>{try{await API.req({action:'import',nodes:JSON.parse(ev.target.result)});this.refresh()}catch{alert('Err')}};
-                r.readAsText(f);
-            },
-            
-            copyText(text, btn) {
-                navigator.clipboard.writeText(text);
-                const original = btn.innerHTML;
-                btn.style.color = 'var(--a)';
-                // If it's the copy icon, don't change text, just color. If it's name text, change text.
-                if(!btn.innerHTML.includes('<svg')) {
-                    btn.innerText = TEXTS[this.lang].copy;
-                }
-                setTimeout(()=>{ 
-                    btn.innerHTML = original; 
-                    btn.style.color = ''; 
-                }, 1000);
-            }
-        };
-        App.init();
-    </script>
-</body></html>`;
-        return new Response(html, { headers: { "Content-Type": "text/html" } });
+      return new Response(
+        JSON.stringify({ error: "Bad Gateway", code: 502, message: "All proxy attempts failed." }),
+        { status: 502, headers: errHeaders }
+      );
     }
+  }
 };
 
 // ============================================================================
-// 5. MAIN ENTRY Cookie 1天版
+// 4. 日志与观测模块 (LOGGER & OPS MODULE)
+// 说明：
+// - 这里负责请求日志的内存排队、批量刷入 D1，以及运行状态的最小回写。
+// - 这是“可解释观测”边界，不承诺强一致审计。
 // ============================================================================
-export default {
-    async fetch(request, env, ctx) {
-        const url = new URL(request.url);
-        // 解码路径片段，处理中文路径等情况
-        const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-        const root = segments[0];
+const Logger = {
+  record(env, ctx, logData) {
+    const db = Database.getDB(env);
+    if (!db || !ctx) return;
+    if (logData.requestMethod === "OPTIONS") return;
 
-        // 1. 管理后台逻辑
-        if (root === "admin") {
-            const ct = request.headers.get("content-type") || "";
-            if (request.method === "POST" && ct.includes("form")) return Auth.handleLogin(request, env);
-            if (!(await Auth.verifyRequest(request, env))) {
-                if (request.method === "POST") return new Response("Unauthorized", { status: 401 });
-                return UI.renderLoginPage();
-            }
-            if (request.method === "POST") return Database.handleApi(request, env);
-            return UI.renderAdminUI();
+    const currentMs = nowMs();
+    let dedupeWindow = 0;
+    if (logData.requestMethod === "HEAD") dedupeWindow = 300000;
+    else if (logData.category === "segment" || logData.category === "prewarm") dedupeWindow = 30000;
+
+    if (dedupeWindow > 0) {
+      const dedupKey = [logData.nodeName || "unknown", logData.requestMethod || "GET", logData.statusCode || 0, logData.requestPath || "/", logData.clientIp || "unknown"].join("|");
+      const lastSeen = GLOBALS.LogDedupe.get(dedupKey);
+      if (lastSeen && (currentMs - lastSeen) < dedupeWindow) return;
+      GLOBALS.LogDedupe.set(dedupKey, currentMs);
+      if (GLOBALS.LogDedupe.size > 10000) {
+        const scannedEntries = [];
+        for (const [key, ts] of GLOBALS.LogDedupe) {
+          scannedEntries.push([key, ts]);
+          if (scannedEntries.length >= 5000) break;
+        }
+        for (const [key, ts] of scannedEntries) {
+          if (!GLOBALS.LogDedupe.has(key)) continue;
+          if ((currentMs - ts) > dedupeWindow) {
+            GLOBALS.LogDedupe.delete(key);
+          } else {
+            // 把已检查但仍在窗口内的热点 key 滚到尾部，避免前缀长期占住裁剪游标。
+            GLOBALS.LogDedupe.delete(key);
+            GLOBALS.LogDedupe.set(key, ts);
+          }
+          if (GLOBALS.LogDedupe.size <= 5000) break;
+        }
+      }
+    }
+
+    GLOBALS.LogQueue.push({
+      timestamp: currentMs,
+      nodeName: logData.nodeName || "unknown",
+      requestPath: logData.requestPath || "/",
+      requestMethod: logData.requestMethod || "GET",
+      statusCode: Number(logData.statusCode) || 0,
+      responseTime: Number(logData.responseTime) || 0,
+      clientIp: logData.clientIp || "unknown",
+      userAgent: logData.userAgent || null,
+      referer: logData.referer || null,
+      category: logData.category || "api",
+      errorDetail: logData.errorDetail || null, // [新增] 记录错误详情
+      createdAt: new Date().toISOString()
+    });
+    // 💡 [极简修复 1] 内存泄流阀：如果 D1 阻塞导致队列堆积，强行丢弃最老的日志，死守内存底线
+    if (GLOBALS.LogQueue.length > 2000) {
+      GLOBALS.LogQueue.splice(0, 1000); 
+      Database.patchOpsStatus(env, {
+        log: {
+          lastOverflowAt: new Date().toISOString(),
+          lastOverflowDropCount: 1000,
+          queueLengthAfterDrop: GLOBALS.LogQueue.length
+        }
+      }, ctx);
+      console.error("Log queue overflow, dropping 1000 logs to prevent OOM.");
+    }
+
+    if (!GLOBALS.LogLastFlushAt) GLOBALS.LogLastFlushAt = currentMs;
+    const configuredDelayMinutes = Number(GLOBALS.ConfigCache?.data?.logWriteDelayMinutes);
+    const configuredFlushCount = Number(GLOBALS.ConfigCache?.data?.logFlushCountThreshold);
+    const flushWindowMs = Math.max(0, Number.isFinite(configuredDelayMinutes) ? configuredDelayMinutes * 60000 : Config.Defaults.LogFlushDelayMinutes * 60000);
+    const flushCountThreshold = Math.max(1, Number.isFinite(configuredFlushCount) ? Math.floor(configuredFlushCount) : Config.Defaults.LogFlushCountThreshold);
+    const shouldFlush = GLOBALS.LogQueue.length >= flushCountThreshold || flushWindowMs === 0 || (currentMs - GLOBALS.LogLastFlushAt) >= flushWindowMs;
+    if (shouldFlush && !GLOBALS.LogFlushPending) {
+      GLOBALS.LogFlushPending = true;
+      ctx.waitUntil(this.flush(env).finally(() => {
+        GLOBALS.LogFlushPending = false;
+        GLOBALS.LogLastFlushAt = nowMs();
+      }));
+    }
+  },
+  async flush(env) {
+    const db = Database.getDB(env);
+    if (!db || GLOBALS.LogQueue.length === 0) return;
+    const batchLogs = GLOBALS.LogQueue.splice(0, GLOBALS.LogQueue.length);
+    const chunkSize = Math.max(1, parseInt(Config.Defaults.LogBatchChunkSize, 10) || 50);
+    let writtenCount = 0;
+    try {
+      for (let index = 0; index < batchLogs.length; index += chunkSize) {
+        const chunk = batchLogs.slice(index, index + chunkSize);
+        const statements = chunk.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.createdAt));
+        await db.batch(statements);
+        writtenCount += chunk.length;
+      }
+      await Database.patchOpsStatus(env, {
+        log: {
+          lastFlushAt: new Date().toISOString(),
+          lastFlushCount: writtenCount,
+          lastFlushStatus: "success",
+          queueLengthAfterFlush: GLOBALS.LogQueue.length,
+          lastFlushError: null
+        }
+      });
+    } catch (e) {
+      // 🌟 性能防御：D1 写入失败直接丢弃批次，严禁 unshift 导致队列内存堆积与时间轴错乱
+      await Database.patchOpsStatus(env, {
+        log: {
+          lastFlushErrorAt: new Date().toISOString(),
+          lastFlushStatus: "failed",
+          lastFlushError: e?.message || String(e),
+          lastDroppedBatchSize: Math.max(0, batchLogs.length - writtenCount),
+          lastFlushWrittenBeforeError: writtenCount,
+          queueLengthAfterFlush: GLOBALS.LogQueue.length
+        }
+      });
+      console.log("Log flush failed, dropping batch.", e);
+    }
+  }
+};
+
+// ============================================================================
+// 5. 新版 SAAS UI (纯净版：彻底删除所有冗余设置)
+// ============================================================================
+const UI_HTML = `<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Emby Proxy V18.0 - SaaS Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: { extend: { colors: { brand: { 50: '#eff6ff', 500: '#3b82f6', 600: '#2563eb' } } } }
+    }
+  </script>
+  <style>
+    .glass-card { background: rgba(255,255,255,0.9); backdrop-filter: blur(12px); border: 1px solid #e2e8f0; }
+    .dark .glass-card { background: rgba(15,23,42,0.6); border: 1px solid rgba(255,255,255,0.08); }
+    .view-section { display: none; }
+    .view-section.active { display: block; animation: fadeIn 0.3s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    aside { transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+  </style>
+</head>
+<body class="bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 antialiased overflow-hidden flex h-[100dvh]">
+
+  <div id="sidebar-backdrop" onclick="App.toggleSidebar()" class="fixed inset-0 bg-slate-950/60 z-20 hidden backdrop-blur-sm transition-opacity"></div>
+
+  <aside id="sidebar" class="w-64 h-full border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex flex-col z-30 absolute md:relative -translate-x-full md:translate-x-0 shadow-2xl md:shadow-none pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)]">
+    <div class="h-16 flex items-center px-6 border-b border-slate-200 dark:border-slate-800">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-indigo-600 flex items-center justify-center text-white font-bold text-lg flex-shrink-0">E</div>
+      <h1 class="ml-3 font-semibold tracking-tight text-lg flex items-center gap-2">
+        Emby Proxy 
+        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.0</span>
+      </h1>
+    </div>
+    <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-1">
+      <a href="#dashboard" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="layout-dashboard" class="w-5 h-5 mr-3"></i> 仪表盘</a>
+      <a href="#nodes" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="server" class="w-5 h-5 mr-3"></i> 节点列表</a>
+      <a href="#logs" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="activity" class="w-5 h-5 mr-3"></i> 日志记录</a>
+      <div class="my-4 border-t border-slate-200 dark:border-slate-800"></div>
+      <a href="#settings" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="settings" class="w-5 h-5 mr-3"></i> 全局设置</a>
+    </nav>
+  </aside>
+
+  <main class="flex-1 flex flex-col h-full min-w-0 relative">
+    <header class="flex items-center justify-between px-6 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 z-10 sticky top-0 h-[calc(4rem+env(safe-area-inset-top))] pt-[env(safe-area-inset-top)] pl-[max(1.5rem,env(safe-area-inset-left))] pr-[max(1.5rem,env(safe-area-inset-right))]">
+      <div class="flex items-center">
+        <button onclick="App.toggleSidebar()" class="md:hidden mr-4 text-slate-500 hover:text-slate-900"><i data-lucide="menu" class="w-5 h-5"></i></button>
+        <h2 id="page-title" class="text-lg font-semibold tracking-tight">加载中...</h2>
+      </div>
+      <div class="flex items-center space-x-4">
+        <a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" class="text-slate-400 hover:text-slate-900 dark:hover:text-white transition"><i data-lucide="github" class="w-5 h-5"></i></a>
+        <button onclick="App.toggleTheme()" class="text-slate-400 hover:text-brand-500 transition"><i data-lucide="sun" class="w-5 h-5 dark:hidden"></i><i data-lucide="moon" class="w-5 h-5 hidden dark:block"></i></button>
+      </div>
+    </header>
+
+    <div id="content-area" class="flex-1 overflow-y-auto p-4 md:p-8 pb-[calc(1rem+env(safe-area-inset-bottom))] md:pb-[calc(2rem+env(safe-area-inset-bottom))] pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]">
+      
+      <div id="view-dashboard" class="view-section w-full mx-auto space-y-6">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+           <div class="glass-card rounded-3xl p-6 shadow-sm border-l-4 border-blue-500 min-w-0 overflow-hidden relative"><p class="text-sm text-slate-500 truncate">今日请求量</p><h3 class="text-2xl md:text-3xl font-bold mt-2 break-all" id="dash-req-count">0</h3><p class="text-xs font-medium text-slate-500 mt-2 break-all" id="dash-req-hint">&nbsp;</p><div id="dash-req-meta" class="flex flex-wrap gap-2 mt-3"></div><p class="text-[11px] font-medium text-brand-600 dark:text-brand-400 mt-2 break-all bg-brand-50 dark:bg-brand-500/10 inline-block px-2.5 py-1 rounded-md" id="dash-emby-metrics">请求: 播放 0 次 | 信息 0 次 , 加速 0秒</p></div>
+           <div class="glass-card rounded-3xl p-6 shadow-sm border-l-4 border-emerald-500 min-w-0 overflow-hidden"><p class="text-sm text-slate-500 truncate">视频流量 (CF Zone 总流量)</p><h3 class="text-2xl md:text-3xl font-bold mt-2 break-all" id="dash-traffic-count">0 B</h3><p class="text-xs font-medium text-slate-500 mt-2 break-all" id="dash-traffic-hint">&nbsp;</p><div id="dash-traffic-meta" class="flex flex-wrap gap-2 mt-3"></div><p class="text-[11px] text-slate-400 mt-2 break-all whitespace-pre-line" id="dash-traffic-detail">&nbsp;</p></div>
+           <div class="glass-card rounded-3xl p-6 shadow-sm border-l-4 border-purple-500 min-w-0 overflow-hidden"><p class="text-sm text-slate-500 truncate">接入节点</p><h3 class="text-2xl md:text-3xl font-bold mt-2 break-all" id="dash-node-count">0</h3><p id="dash-node-meta" class="text-xs font-medium text-slate-500 mt-2 break-all">&nbsp;</p><div id="dash-node-badges" class="flex flex-wrap gap-2 mt-3"></div></div>
+        </div>
+        <div class="glass-card rounded-3xl p-6 shadow-sm">
+          <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div>
+              <h3 class="font-semibold text-lg">运行状态</h3>
+              <p id="dash-runtime-updated" class="text-xs text-slate-500 mt-1">最近同步：未加载</p>
+            </div>
+            <button onclick="App.loadDashboard()" class="px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-xl text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition flex items-center justify-center">
+              <i data-lucide="refresh-cw" class="w-4 h-4 mr-2"></i>刷新状态
+            </button>
+          </div>
+          <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 mt-4">
+            <div id="dash-runtime-log-card" class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4">
+              <p class="text-sm text-slate-500">日志写入状态加载中...</p>
+            </div>
+            <div id="dash-runtime-scheduled-card" class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4">
+              <p class="text-sm text-slate-500">定时任务状态加载中...</p>
+            </div>
+          </div>
+        </div>
+        <div class="glass-card rounded-3xl p-6 shadow-sm flex flex-col">
+           <h3 class="font-semibold text-lg mb-4">请求趋势</h3>
+           <div class="relative w-full h-64 md:h-80 2xl:h-[40vh] min-h-[250px] 2xl:min-h-[450px]"><canvas id="trafficChart"></canvas></div>
+           <p class="text-xs text-slate-500 mt-4">Y 轴（纵轴）代表：该小时内的“请求总次数”；X 轴（横轴）代表：当前天的“小时”时间刻度（UTC+8）。</p>
+        </div>
+      </div>
+
+      <div id="view-nodes" class="view-section w-full mx-auto space-y-6">
+        <div class="flex flex-col xl:flex-row justify-between items-center gap-4">
+          <div class="flex items-center gap-2 w-full xl:w-auto">
+            <button onclick="App.showNodeModal()" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm font-medium hover:bg-brand-700 flex items-center transition whitespace-nowrap"><i data-lucide="plus" class="w-4 h-4 mr-2"></i> 新建节点</button>
+            <input type="text" id="node-search" placeholder="搜索节点名称或标签..." class="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white w-full sm:w-64 transition" oninput="App.renderNodesGrid()">
+          </div>
+          <div class="flex flex-wrap gap-2 w-full xl:w-auto">
+            <button onclick="document.getElementById('import-nodes-file').click()" class="flex-1 sm:flex-none px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition flex items-center justify-center"><i data-lucide="upload" class="w-4 h-4 mr-2"></i> 导入配置</button>
+            <button onclick="App.exportNodes()" class="flex-1 sm:flex-none px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition flex items-center justify-center"><i data-lucide="download" class="w-4 h-4 mr-2"></i> 导出配置</button>
+            <button onclick="App.forceHealthCheck(event)" class="w-full sm:w-auto px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm font-medium hover:bg-emerald-700 flex items-center justify-center transition"><i data-lucide="activity" class="w-4 h-4 mr-2"></i> 全局 Ping</button>
+            <input type="file" id="import-nodes-file" class="hidden" accept=".json" onchange="App.importNodes(event)">
+            <input type="file" id="import-full-file" class="hidden" accept=".json" onchange="App.importFull(event)">
+          </div>
+        </div>
+        <div id="nodes-grid" class="grid gap-6 grid-cols-[repeat(auto-fill,minmax(340px,1fr))]"></div>
+      </div>
+
+      <div id="view-logs" class="view-section w-full mx-auto space-y-6">
+        <div class="glass-card rounded-3xl p-6 shadow-sm flex flex-col min-h-[calc(100vh-120px)]">
+          <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+            <h3 class="font-semibold text-lg flex-shrink-0">日志记录</h3>
+            <div class="flex flex-wrap items-center gap-2 w-full md:w-auto">
+              <input type="text" id="log-search-input" placeholder="搜索节点、IP、路径或状态码(如200)..." class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white flex-1 md:w-56" onkeydown="if(event.key==='Enter') App.loadLogs(1)">
+              <button onclick="App.loadLogs(1)" class="text-brand-500 text-sm px-2 hover:text-brand-600"><i data-lucide="search" class="w-4 h-4 inline"></i></button>
+              
+              <div class="w-px h-5 bg-slate-300 dark:bg-slate-700 mx-1 hidden md:block"></div>
+              
+              <button onclick="App.apiCall('initLogsDb').then(()=>alert('初始化完成'))" class="text-slate-500 text-sm hover:text-brand-500"><i data-lucide="database" class="w-4 h-4 inline mr-1"></i>初始化 DB</button>
+              <button onclick="if(confirm('确定清空所有日志?')) App.apiCall('clearLogs').then(()=>App.loadLogs(1))" class="text-red-500 text-sm hover:text-red-600 ml-2"><i data-lucide="trash-2" class="w-4 h-4 inline mr-1"></i>清空日志</button>
+              <button onclick="App.loadLogs()" class="text-brand-500 text-sm ml-2"><i data-lucide="refresh-cw" class="w-4 h-4 inline mr-1"></i>刷新</button>
+            </div>
+          </div>
+          <div class="overflow-x-auto min-h-0 w-full mb-4">
+            <table class="w-full text-left border-collapse table-fixed min-w-[900px]">
+              <thead><tr class="text-sm text-slate-500 border-b border-slate-200 dark:border-slate-800"><th class="py-3 px-4 w-24 md:w-28">节点</th><th class="py-3 px-4 w-28 md:w-32">资源类别</th><th class="py-3 px-4 w-16 md:w-20">状态</th><th class="py-3 px-4 w-32">IP</th><th class="py-3 px-4">UA</th><th class="py-3 px-4 w-28">时间锥</th></tr></thead>
+              <tbody id="logs-tbody" class="text-sm"></tbody>
+            </table>
+          </div>
+          <div class="flex justify-between items-center mt-auto pt-6 border-t border-slate-200 dark:border-slate-800">
+              <button onclick="App.changeLogPage(-1)" class="px-4 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition">上一页</button>
+              <span id="log-page-info" class="text-sm font-mono text-slate-500">1 / 1</span>
+              <button onclick="App.changeLogPage(1)" class="px-4 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition">下一页</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="view-settings" class="view-section max-w-4xl mx-auto space-y-6">
+        <div class="glass-card rounded-3xl p-6 flex flex-col md:flex-row gap-6">
+           <div class="w-full md:w-48 flex flex-row md:flex-col gap-2 md:gap-0 md:space-y-1 border-b md:border-b-0 md:border-r border-slate-200 dark:border-slate-800 pb-4 md:pb-0 pr-0 md:pr-4 overflow-x-auto whitespace-nowrap">
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg bg-brand-50 text-brand-600 dark:bg-brand-500/10 dark:text-brand-400 text-sm font-medium" onclick="App.switchSetTab(event, 'ui')">系统 UI</button>
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'proxy')">代理与网络</button>
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'security')">缓存与安全</button>
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'logs')">日志与监控</button>
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'account')">账号与备份</button>
+           </div>
+           <div class="flex-1" id="settings-forms">
+              
+              <div id="set-ui" class="block">
+                <h3 class="font-bold mb-4 text-slate-900 dark:text-white">UI 外观偏好</h3>
+                <p class="text-sm text-slate-500 mb-4">外观偏好直接保存在本地浏览器缓存中。点击右上角太阳/月亮图标即可切换深浅模式。</p>
+              </div>
+              
+              <div id="set-proxy" class="hidden">
+                <h3 class="font-bold mb-4 text-slate-900 dark:text-white">网络协议与优化</h3>
+                <p class="text-sm text-slate-500 mb-4">默认强制所有数据在 H1.1 下流通以保持最佳的单线程连贯性（并自动注入长连接参数）。</p>
+                <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-enable-h2" class="mr-2 w-4 h-4 rounded"> 允许开启 HTTP/2 (不建议)</label>
+                <p class="text-xs text-slate-500 mb-3 ml-6">适合少数明确支持多路复用的上游；部分视频源在分片、长连接或头部兼容性上反而更容易出现异常。</p>
+                <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-enable-h3" class="mr-2 w-4 h-4 rounded"> 允许开启 HTTP/3 QUIC (推荐良好网络开启)</label>
+                <p class="text-xs text-slate-500 mb-3 ml-6">适合网络质量稳定、丢包率低的环境；弱网或运营商链路复杂时，实际稳定性未必优于 HTTP/1.1。</p>
+                <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-peak-downgrade" class="mr-2 w-4 h-4 rounded" checked> 晚高峰 (20:00 - 24:00) 自动降级为 HTTP/1.1 兜底</label>
+                <p class="text-xs text-slate-500 mb-3 ml-6">高峰时段优先稳态传输，减少握手抖动、异常回源和多路复用放大的兼容性问题。</p>
+                <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-protocol-fallback" class="mr-2 w-4 h-4 rounded" checked> 开启协议回退与 403 重试 (剥离报错头重连，缓解视频报错)</label>
+                <p class="text-xs text-slate-500 mb-4 ml-6">当上游返回 403 或握手异常时，自动剥离可疑报错头并切换到更稳的协议后重试一次。</p>
+                <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">起播加速优化 (Prewarm)</h3>
+                <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-enable-prewarm" class="mr-2 w-4 h-4 rounded" checked> 开启视频起播预热拦截</label>
+                <p class="text-xs text-slate-500 mb-3 ml-6">精准拦截播放器起播时的探测请求，利用 Cloudflare 边缘节点进行微型缓存，极大提升起播速度并保护源站。</p>
+                <label class="block text-sm text-slate-500 mb-1 ml-6">预热微缓存时长 (秒)</label>
+                <input type="number" id="cfg-prewarm-ttl" class="w-full md:w-1/2 p-2 ml-6 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="180">
+                <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">跳转代理开关</h3>
+                <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-source-same-origin-proxy" class="mr-2 w-4 h-4 rounded" checked> 默认开启：源站和同源跳转代理</label>
+                <p class="text-xs text-slate-500 mb-3">开启时既包含源站 2xx 的 Worker 透明拉流，也包含同源 30x 的继续代理跳转；仅当节点被显式标记为直连时，源站 2xx 才会改为直连源站。关闭后，同源 30x 直接下发 Location。</p>
+                <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-force-external-proxy" class="mr-2 w-4 h-4 rounded" checked> 默认开启：强制反代外部链接</label>
+                <p class="text-xs text-slate-500 mb-3">开启后 Worker 会作为中继站拉流并透明转发；除国内网盘/对象存储外默认不缓存，命中 <code>wangpandirect</code> 列表走直连。关闭后外部链接直接下发直连。</p>
+                <p class="text-xs text-slate-500 mb-2">默认已填入内置关键词；请使用英文逗号分隔自定义内容，例如 <code>baidu,alibaba</code>。</p>
+                <label class="block text-sm text-slate-500 mb-1">wangpandirect 直连黑名单（关键词模糊匹配，英文逗号分隔）</label>
+                <textarea id="cfg-wangpandirect" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white resize-y" rows="3" placeholder="例如: baidu,alibaba"></textarea>
+
+                <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">源站直连名单</h3>
+                <p class="text-xs text-slate-500 mb-3">这里列出现有节点。勾选后，这些节点在“源站和同源跳转代理”开启时，源站 2xx 会直接下发到源站，不再由 Worker 中继；未勾选节点继续由 Worker 透明拉流。</p>
+                <input type="text" id="cfg-direct-node-search" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" placeholder="搜索节点名称、标签或备注..." oninput="App.renderSourceDirectNodesPicker()">
+                <div id="cfg-source-direct-nodes-summary" class="text-xs text-slate-500 mb-2">已选 0 个节点</div>
+                <div id="cfg-source-direct-nodes-list" class="max-h-64 overflow-y-auto rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-950/60 p-2 space-y-2 mb-4"></div>
+                
+                <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">健康检查探测</h3>
+                <label class="block text-sm text-slate-500 mb-1">Ping 超时时间 (毫秒)</label>
+                <input type="number" id="cfg-ping-timeout" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="5000">
+                <button onclick="App.saveSettings('proxy')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存代理网络</button>
+              </div>
+
+              <div id="set-security" class="hidden">
+                <h3 class="font-bold mb-4 text-slate-900 dark:text-white">安全防火墙与缓存引擎</h3>
+                <label class="block text-sm text-slate-500 mb-1">国家/地区白名单 (留空不限制，如: CN,HK)</label>
+                <p class="text-xs text-slate-500 mb-2">仅允许这些国家/地区的访客源 IP 访问；识别依据是 Cloudflare 看到的用户公网 IP 所属地区，不是你的源站位置。</p>
+                <input type="text" id="cfg-geo-allow" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" placeholder="例如: CN,HK">
+                
+                <label class="block text-sm text-slate-500 mb-1">国家/地区黑名单 (屏蔽指定国家，如: US,SG)</label>
+                <p class="text-xs text-slate-500 mb-2">按访客源 IP 所属国家/地区直接拦截，可用于屏蔽不希望访问的海外地区或异常流量来源。</p>
+                <input type="text" id="cfg-geo-block" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" placeholder="例如: US">
+                
+                <label class="block text-sm text-slate-500 mb-1">IP 黑名单 (逗号分隔)</label>
+                <p class="text-xs text-slate-500 mb-2">这里屏蔽的是访问者的公网 IP；命中后会直接拒绝该用户/设备的请求，适合封禁恶意爬虫、攻击源或异常账号。</p>
+                <textarea id="cfg-ip-black" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white resize-y" rows="2"></textarea>
+                
+                <label class="block text-sm text-slate-500 mb-1">全局单 IP 限速 (请求/分钟，0为不限制)</label>
+                <p class="text-xs text-slate-500 mb-2">对单个访客源 IP 生效；超过阈值后可快速压制刷接口、扫库和异常爆发流量。</p>
+                <input type="number" id="cfg-rate-limit" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" placeholder="如: 600">
+                
+                <label class="block text-sm text-slate-500 mb-1">图片海报缓存时长 (天)</label>
+                <p class="text-xs text-slate-500 mb-2">仅影响海报、封面等图片静态资源的边缘缓存时长，不影响视频主流量的回源策略。</p>
+                <input type="number" id="cfg-cache-ttl" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="30">
+                
+                <label class="block text-sm text-slate-500 mb-1">CORS 跨域白名单 (留空为 *，如 https://emby.com)</label>
+                <p class="text-xs text-slate-500 mb-2">用于限制哪些网页前端可以在浏览器里跨域调用本 Worker API；它主要影响浏览器环境，不影响服务器到服务器的直连请求。</p>
+                <input type="text" id="cfg-cors" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white">
+                
+                <button onclick="App.saveSettings('security')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存安全防护</button>
+              </div>
+              
+              <div id="set-logs" class="hidden">
+                <h3 class="font-bold mb-4 text-slate-900 dark:text-white">监控与日志配置</h3>
+                <label class="block text-sm text-slate-500 mb-1">日志保存天数 (超过将由系统自动清理)</label>
+                <input type="number" id="cfg-log-days" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="7">
+                <label class="block text-sm text-slate-500 mb-1">日志写入延迟（分钟）</label>
+                <input type="number" min="0" step="0.5" id="cfg-log-delay" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="20">
+                <label class="block text-sm text-slate-500 mb-1">日志提前写入条数阈值</label>
+                <input type="number" min="1" step="1" id="cfg-log-flush-count" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="50">
+                <p class="text-xs text-slate-500 mb-4">内存日志队列满足“达到延迟分钟”或“累计达到条数阈值”任一条件即写入 D1。默认 20 分钟 / 50 条；设延迟为 0 表示尽快写入。</p>
+                
+                <h3 class="font-bold mb-4 mt-6 text-slate-900 dark:text-white border-t border-slate-200 dark:border-slate-800 pt-4">Telegram 每日报表与告警机器人</h3>
+                
+                <label class="block text-sm text-slate-500 mb-1">Telegram Bot Token</label>
+                <input type="text" id="cfg-tg-token" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" placeholder="如: 123456789:ABCdefGHIjklMNOpqrSTUvwxYZ">
+                
+                <label class="block text-sm text-slate-500 mb-1">Telegram Chat ID (接收人ID)</label>
+                <input type="text" id="cfg-tg-chatid" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" placeholder="如: 123456789">
+                
+                <div class="flex flex-wrap gap-2">
+                    <button onclick="App.saveSettings('logs')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存监控设置</button>
+                    <button onclick="App.testTelegram()" class="px-4 py-2 border border-blue-200 text-blue-600 rounded-xl text-sm transition hover:bg-blue-50 dark:border-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/20 flex items-center justify-center"><i data-lucide="send" class="w-4 h-4 mr-1"></i> 发送测试通知</button>
+                    <button onclick="App.sendDailyReport()" class="px-4 py-2 border border-emerald-200 text-emerald-600 rounded-xl text-sm transition hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20 flex items-center justify-center"><i data-lucide="file-bar-chart" class="w-4 h-4 mr-1"></i> 手动发送日报</button>
+                </div>
+              </div>
+              
+              <div id="set-account" class="hidden">
+                <h3 class="font-bold mb-4 text-slate-900 dark:text-white">系统账号与安全</h3>
+                <label class="block text-sm text-slate-500 mb-1">免密登录有效天数 (管理员 JWT)</label>
+                <input type="number" id="cfg-jwt-days" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="30">
+                
+                <h3 class="font-bold mb-4 border-t border-slate-200 dark:border-slate-800 pt-4 text-slate-900 dark:text-white">Cloudflare 联动</h3>
+                <label class="block text-sm text-slate-500 mb-1">Cloudflare 账号 ID</label>
+                <input type="text" id="cfg-cf-account" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white">
+                <label class="block text-sm text-slate-500 mb-1">Cloudflare Zone ID (区域ID，用于面板数据与清理缓存)</label>
+                <input type="text" id="cfg-cf-zone" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white">
+                <label class="block text-sm text-slate-500 mb-1">Cloudflare API 令牌</label>
+                <input type="password" id="cfg-cf-token" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white">
+                <div class="flex gap-2 mb-6">
+                    <button onclick="App.saveSettings('account')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存账号设置</button>
+                    <button onclick="App.purgeCache()" class="px-4 py-2 border border-red-200 text-red-600 rounded-xl text-sm transition hover:bg-red-50 dark:border-red-900/30 dark:hover:bg-red-900/20">一键清理全站缓存 (Purge)</button>
+                </div>
+
+                <h3 class="font-bold mb-4 border-t border-slate-200 dark:border-slate-800 pt-4 text-slate-900 dark:text-white">备份与恢复 (全量 KV 数据)</h3>
+                <p class="text-sm text-slate-500 mb-4">导出或导入系统内的所有节点以及全局设置数据（单文件）。</p>
+                <div class="flex gap-4">
+                  <button onclick="document.getElementById('import-full-file').click()" class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload" class="w-4 h-4 inline mr-1"></i> 导入完整备份</button>
+                  <button onclick="App.exportFull()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition font-medium"><i data-lucide="download" class="w-4 h-4 inline mr-1"></i> 导出完整备份</button>
+                </div>
+              </div>
+              
+           </div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <dialog id="node-modal" class="backdrop:bg-slate-950/60 bg-transparent w-11/12 md:w-full max-w-xl m-auto p-0">
+    <div class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 shadow-2xl">
+      <h2 class="text-xl font-bold mb-4 text-slate-900 dark:text-white" id="node-modal-title">新建节点</h2>
+     <form onsubmit="App.saveNode(event)" class="space-y-4 max-h-[calc(80vh-env(safe-area-inset-bottom)-env(safe-area-inset-top))] overflow-y-auto pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[max(0.5rem,env(safe-area-inset-right))]">
+        <input type="hidden" id="form-original-name">
+        <div><label class="block text-sm text-slate-500 mb-1">节点名称</label><input type="text" id="form-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" required></div>
+        <div><label class="block text-sm text-slate-500 mb-1">目标源站 (Target)</label><input type="url" id="form-target" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white" required></div>
+        
+        <div><label class="block text-sm text-slate-500 mb-1">访问鉴权 (Secret, 可留空)</label><input type="text" id="form-secret" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
+        
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div><label class="block text-sm text-slate-500 mb-1">标签</label><input type="text" id="form-tag" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
+          <div><label class="block text-sm text-slate-500 mb-1">备注</label><input type="text" id="form-remark" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
+        </div>
+        
+        <div class="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800">
+          <label class="block text-sm font-medium mb-2 text-slate-900 dark:text-white">自定义请求头 (覆盖或新增)</label>
+          <div id="headers-container" class="space-y-2 mb-3"></div>
+          <button type="button" onclick="App.addHeaderRow()" class="text-xs font-medium text-brand-600 hover:text-brand-700 bg-brand-50 dark:bg-brand-500/10 dark:text-brand-400 px-3 py-1.5 rounded-lg transition">+ 添加请求头</button>
+        </div>
+
+        <div class="flex gap-3 mt-6 sticky bottom-0 bg-white dark:bg-slate-900 py-3 border-t border-slate-100 dark:border-slate-800 z-10 shadow-[0_-10px_15px_-3px_rgba(0,0,0,0.05)] dark:shadow-none">
+           <button type="button" onclick="document.getElementById('node-modal').close()" class="flex-1 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-900 dark:text-white transition shadow-sm">取消</button>
+           <button type="submit" class="flex-1 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium transition shadow-sm">保存</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <script>
+    const App = {
+      nodes: [],
+      settingsSourceDirectNodes: [],
+      nodeHealth: {},
+      nodeMutationSeq: 0,
+      nodeMutationVersion: {},
+      logPage: 1,
+      logTotalPages: 1,
+      dashboardSeries: [],
+      dashboardLoadSeq: 0,
+      runtimeStatus: {},
+      loginPromise: null,
+      chart: null,
+
+      safeCreateIcons(opts = {}) {
+          if (typeof window.lucide !== 'undefined') {
+              window.lucide.createIcons(opts);
+          }
+      },
+
+      simpleHash(str) {
+        const input = String(str || "");
+        let hash = 0;
+        for (let i = 0; i < input.length; i++) {
+          hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+        }
+        return String(hash >>> 0).toString(36);
+      },
+
+      safeDomId(prefix, value) {
+        const base = String(value || "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "node";
+        return prefix + "-" + base + "-" + this.simpleHash(value);
+      },
+
+      buildNodeLink(node) {
+        const encodedName = encodeURIComponent(String(node.name || ""));
+        const encodedSecret = node.secret ? "/" + encodeURIComponent(String(node.secret)) : "";
+        return window.location.origin + "/" + encodedName + encodedSecret;
+      },
+      normalizeNodeKey(value) {
+        return String(value || '').trim().toLowerCase();
+      },
+      normalizeNodeNameList(value) {
+        const rawList = Array.isArray(value) ? value : String(value || '').split(/[\\r\\n,，;；|]+/);
+        const seen = new Set();
+        const result = [];
+        rawList.forEach(item => {
+          const name = String(item || '').trim();
+          if (!name) return;
+          const key = name.toLowerCase();
+          if (seen.has(key)) return;
+          seen.add(key);
+          result.push(name);
+        });
+        return result;
+      },
+      markNodeMutation(names) {
+        const mutationId = ++this.nodeMutationSeq;
+        this.normalizeNodeNameList(names).forEach(name => {
+          const key = this.normalizeNodeKey(name);
+          if (key) this.nodeMutationVersion[key] = mutationId;
+        });
+        return mutationId;
+      },
+      isNodeMutationCurrent(names, mutationId) {
+        const keys = this.normalizeNodeNameList(names)
+          .map(name => this.normalizeNodeKey(name))
+          .filter(Boolean);
+        return keys.length > 0 && keys.every(key => this.nodeMutationVersion[key] === mutationId);
+      },
+      async rollbackNodesState(message) {
+        try {
+          await this.loadNodes();
+        } catch (rollbackErr) {
+          console.error('loadNodes rollback failed', rollbackErr);
+          alert(message + '；自动回滚失败，请检查网络后手动刷新页面');
+          return;
+        }
+        alert(message);
+      },
+
+      updateSourceDirectNodesSummary() {
+        const summary = document.getElementById('cfg-source-direct-nodes-summary');
+        if (!summary) return;
+        const total = Array.isArray(this.nodes) ? this.nodes.length : 0;
+        const selectedCount = this.normalizeNodeNameList(this.settingsSourceDirectNodes).length;
+        summary.textContent = total ? ('已选 ' + selectedCount + ' / ' + total + ' 个节点作为源站直连') : ('已选 ' + selectedCount + ' 个节点');
+      },
+
+      renderSourceDirectNodesPicker(selectedNames) {
+        if (selectedNames !== undefined) {
+          this.settingsSourceDirectNodes = this.normalizeNodeNameList(selectedNames);
+        } else {
+          this.settingsSourceDirectNodes = this.normalizeNodeNameList(this.settingsSourceDirectNodes);
         }
 
-        // 2. 节点代理逻辑
-        if (root) {
-            const nodeData = await Database.getNode(root, env, ctx);
-            if (nodeData) {
-                const secret = nodeData.secret;
-                let valid = true;
-                let strip = 1;
+        const container = document.getElementById('cfg-source-direct-nodes-list');
+        if (!container) return;
+        const keyword = String(document.getElementById('cfg-direct-node-search')?.value || '').trim().toLowerCase();
+        const nodes = Array.isArray(this.nodes) ? this.nodes.slice() : [];
+        const selectedSet = new Set(this.settingsSourceDirectNodes.map(name => String(name).toLowerCase()));
+        const filteredNodes = nodes
+          .filter(node => {
+            if (!keyword) return true;
+            const haystack = (String(node?.name || '') + ' ' + String(node?.tag || '') + ' ' + String(node?.remark || '')).toLowerCase();
+            return haystack.includes(keyword);
+          })
+          .sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || ''), 'zh-Hans-CN'));
 
-                // 校验 Secret 路径
-                if (secret) {
-                    if (segments[1] === secret) { strip = 2; }
-                    else { valid = false; }
-                }
+        container.innerHTML = '';
 
-                if (valid) {
-                    // -------------------------------------------------------------
-                    // 路径计算与修正逻辑
-                    // -------------------------------------------------------------
-                    
-                    let remaining = "/" + segments.slice(strip).join('/');
-                    
-                    // [修复] 强制根路径补全斜杠
-                    if (remaining === "/" && !url.pathname.endsWith("/")) {
-                        return new Response(null, {
-                            status: 301,
-                            headers: { "Location": url.href + "/" }
-                        });
+        if (!nodes.length) {
+          const empty = document.createElement('div');
+          empty.className = 'text-sm text-slate-500 px-3 py-2';
+          empty.textContent = '暂无可选节点';
+          container.appendChild(empty);
+          this.updateSourceDirectNodesSummary();
+          return;
+        }
+
+        if (!filteredNodes.length) {
+          const empty = document.createElement('div');
+          empty.className = 'text-sm text-slate-500 px-3 py-2';
+          empty.textContent = '没有匹配的节点';
+          container.appendChild(empty);
+          this.updateSourceDirectNodesSummary();
+          return;
+        }
+
+        filteredNodes.forEach(node => {
+          const wrapper = document.createElement('label');
+          wrapper.className = 'flex items-start gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 px-3 py-2 cursor-pointer';
+
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.className = 'mt-1 w-4 h-4 rounded';
+          checkbox.checked = selectedSet.has(String(node?.name || '').toLowerCase());
+          checkbox.onchange = () => {
+            const set = new Set(this.normalizeNodeNameList(this.settingsSourceDirectNodes).map(name => String(name).toLowerCase()));
+            const originalNames = new Map(this.normalizeNodeNameList(this.settingsSourceDirectNodes).map(name => [String(name).toLowerCase(), name]));
+            const nodeName = String(node?.name || '').trim();
+            const nodeKey = nodeName.toLowerCase();
+            if (checkbox.checked) {
+              set.add(nodeKey);
+              originalNames.set(nodeKey, nodeName);
+            } else {
+              set.delete(nodeKey);
+              originalNames.delete(nodeKey);
+            }
+            this.settingsSourceDirectNodes = Array.from(set).map(key => originalNames.get(key) || key);
+            this.updateSourceDirectNodesSummary();
+          };
+
+          const content = document.createElement('div');
+          content.className = 'min-w-0 flex-1';
+          const title = document.createElement('div');
+          title.className = 'text-sm font-medium text-slate-900 dark:text-white truncate';
+          title.textContent = node?.name || '未命名节点';
+          const meta = document.createElement('div');
+          meta.className = 'text-xs text-slate-500 mt-1 break-all';
+          const metaParts = [];
+          if (node?.tag) metaParts.push('标签: ' + node.tag);
+          if (node?.remark) metaParts.push('备注: ' + node.remark);
+          meta.textContent = metaParts.length ? metaParts.join('  ·  ') : '无标签 / 备注';
+          content.appendChild(title);
+          content.appendChild(meta);
+
+          wrapper.appendChild(checkbox);
+          wrapper.appendChild(content);
+          container.appendChild(wrapper);
+        });
+
+        this.updateSourceDirectNodesSummary();
+      },
+
+      validateTargets(targetValue) {
+        const targets = String(targetValue || "").split(",").map(function (item) { return item.trim(); }).filter(Boolean);
+        if (!targets.length) return false;
+        return targets.every(function (item) {
+          try {
+            const url = new URL(item);
+            return url.protocol === "http:" || url.protocol === "https:";
+          } catch {
+            return false;
+          }
+        });
+      },
+
+      async promptLogin() {
+        if (this.loginPromise) return this.loginPromise;
+        this.loginPromise = (async () => {
+          const pass = window.prompt("请输入管理员密码:");
+          if (!pass) throw new Error("LOGIN_CANCELLED");
+          const res = await fetch("/api/auth/login", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: pass })
+          });
+          const data = await res.json().catch(function () { return {}; });
+          if (!res.ok || (!data.ok && !data.token)) throw new Error((data.error && data.error.message) || "登录失败");
+          return true;
+        })();
+        try { return await this.loginPromise; } finally { this.loginPromise = null; }
+      },
+      
+      init() {
+        const savedTheme = localStorage.getItem('theme');
+        if (savedTheme === 'light') { document.documentElement.classList.remove('dark'); }
+        else if (savedTheme === 'dark') { document.documentElement.classList.add('dark'); }
+        else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) { document.documentElement.classList.add('dark'); }
+        
+        this.safeCreateIcons();
+        window.onhashchange = () => this.route();
+        this.route();
+        
+        // Time Cone Sync: 每 60 秒异步刷新一次相对时间
+        setInterval(() => this.updateTimeCones(), 60000);
+      },
+
+      toggleTheme() {
+        const html = document.documentElement;
+        html.classList.toggle('dark');
+        localStorage.setItem('theme', html.classList.contains('dark') ? 'dark' : 'light');
+      },
+
+      escapeHtml(value) {
+        return String(value == null ? '' : value)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      },
+
+      formatLocalDateTime(value) {
+        if (!value) return '未记录';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return String(value);
+        return date.toLocaleString('zh-CN', {
+          hour12: false,
+          timeZone: 'Asia/Shanghai'
+        });
+      },
+
+      summarizeRuntimeTimestamp(value, prefix) {
+        if (!value) return '';
+        return prefix + this.formatLocalDateTime(value);
+      },
+
+      buildDashboardBadge(label, tone = 'slate') {
+        const palette = {
+          emerald: 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400',
+          blue: 'bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400',
+          amber: 'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400',
+          red: 'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400',
+          slate: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+        };
+        return '<span class="px-2.5 py-1 rounded-full text-[11px] font-medium ' + (palette[tone] || palette.slate) + '">' + this.escapeHtml(label) + '</span>';
+      },
+
+      renderDashboardBadges(containerId, items) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        const badges = (Array.isArray(items) ? items : [])
+          .filter(item => item && item.label)
+          .map(item => this.buildDashboardBadge(item.label, item.tone))
+          .join('');
+        container.innerHTML = badges || this.buildDashboardBadge('待加载', 'slate');
+      },
+
+      getRequestSourceBadge(data) {
+        const source = String(data?.requestSource || '').toLowerCase();
+        if (source === 'workers_usage') return { label: '请求口径: Workers Usage', tone: 'emerald' };
+        if (source === 'zone_analytics') return { label: '请求口径: Zone Analytics', tone: 'blue' };
+        if (source === 'd1_logs') return { label: '请求口径: D1 兜底', tone: 'amber' };
+        return { label: '请求口径: 待确认', tone: 'slate' };
+      },
+
+      getTrafficStatusBadge(data) {
+        if (data?.cfAnalyticsLoaded) return { label: '流量状态: Cloudflare 正常', tone: 'emerald' };
+        const status = String(data?.cfAnalyticsStatus || '');
+        if (status.includes('未配置')) return { label: '流量状态: 未配置', tone: 'amber' };
+        if (status.includes('失败') || data?.cfAnalyticsError) return { label: '流量状态: 查询失败', tone: 'red' };
+        return { label: '流量状态: 降级/未知', tone: 'slate' };
+      },
+
+      getStatsFreshnessBadge(data) {
+        const cacheStatus = String(data?.cacheStatus || 'live').toLowerCase();
+        if (cacheStatus === 'cache') return { label: '统计快照: 缓存命中', tone: 'blue' };
+        return { label: '统计快照: 实时汇总', tone: 'emerald' };
+      },
+
+      getRuntimeStatusMeta(status) {
+        const key = String(status || 'idle').toLowerCase();
+        if (key === 'success') return { label: '正常', badgeClass: 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400', dotClass: 'bg-emerald-500' };
+        if (key === 'running') return { label: '运行中', badgeClass: 'bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400', dotClass: 'bg-blue-500' };
+        if (key === 'partial_failure') return { label: '部分失败', badgeClass: 'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400', dotClass: 'bg-amber-500' };
+        if (key === 'failed') return { label: '失败', badgeClass: 'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400', dotClass: 'bg-red-500' };
+        if (key === 'skipped') return { label: '已跳过', badgeClass: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300', dotClass: 'bg-slate-400' };
+        return { label: '待记录', badgeClass: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300', dotClass: 'bg-slate-400' };
+      },
+
+      formatRuntimeStateText(status) {
+        return this.getRuntimeStatusMeta(status).label;
+      },
+
+      buildRuntimeStatusCard(title, status, summary, lines = [], detail = '') {
+        const meta = this.getRuntimeStatusMeta(status);
+        const lineHtml = lines
+          .filter(Boolean)
+          .map(line => '<li class="text-sm text-slate-600 dark:text-slate-300 break-all">' + this.escapeHtml(line) + '</li>')
+          .join('');
+        const detailHtml = detail
+          ? '<p class="text-xs text-slate-400 break-all mt-3">' + this.escapeHtml(detail) + '</p>'
+          : '';
+        return '<div class="h-full rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/60 p-4">'
+          + '<div class="flex items-start justify-between gap-3">'
+          + '<div class="min-w-0">'
+          + '<div class="flex items-center gap-2">'
+          + '<span class="w-2.5 h-2.5 rounded-full ' + meta.dotClass + '"></span>'
+          + '<h4 class="font-semibold text-slate-900 dark:text-white">' + this.escapeHtml(title) + '</h4>'
+          + '</div>'
+          + '<p class="text-xs text-slate-500 mt-1 break-all">' + this.escapeHtml(summary || '暂无运行记录') + '</p>'
+          + '</div>'
+          + '<span class="px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap ' + meta.badgeClass + '">' + this.escapeHtml(meta.label) + '</span>'
+          + '</div>'
+          + '<ul class="space-y-2 mt-4">' + lineHtml + '</ul>'
+          + detailHtml
+          + '</div>';
+      },
+
+      renderRuntimeStatus(statusPayload) {
+        const status = statusPayload && typeof statusPayload === 'object' ? statusPayload : {};
+        this.runtimeStatus = status;
+        const updated = document.getElementById('dash-runtime-updated');
+        if (updated) {
+          updated.textContent = '最近同步：' + this.formatLocalDateTime(status.updatedAt);
+        }
+
+        const log = status.log && typeof status.log === 'object' ? status.log : {};
+        const logSummary = this.summarizeRuntimeTimestamp(log.lastFlushAt || log.lastFlushErrorAt || log.lastOverflowAt, '最近日志事件：');
+        const logLines = [
+          log.lastFlushAt ? ('最近成功写入：' + this.formatLocalDateTime(log.lastFlushAt)) : '',
+          Number.isFinite(Number(log.lastFlushCount)) ? ('最近写入批次：' + Number(log.lastFlushCount) + ' 条') : '',
+          Number.isFinite(Number(log.queueLengthAfterFlush)) ? ('写入后队列长度：' + Number(log.queueLengthAfterFlush)) : '',
+          log.lastOverflowAt ? ('最近队列溢出：' + this.formatLocalDateTime(log.lastOverflowAt) + '，丢弃 ' + (Number(log.lastOverflowDropCount) || 0) + ' 条') : ''
+        ].filter(Boolean);
+        const logDetail = log.lastFlushError ? ('最近写入错误：' + log.lastFlushError) : '';
+        const logCard = document.getElementById('dash-runtime-log-card');
+        if (logCard) {
+          logCard.innerHTML = this.buildRuntimeStatusCard('日志写入', log.lastFlushStatus || (log.lastOverflowAt ? 'partial_failure' : 'idle'), logSummary, logLines, logDetail);
+        }
+
+        const scheduled = status.scheduled && typeof status.scheduled === 'object' ? status.scheduled : {};
+        const cleanup = scheduled.cleanup && typeof scheduled.cleanup === 'object' ? scheduled.cleanup : {};
+        const report = scheduled.report && typeof scheduled.report === 'object' ? scheduled.report : {};
+        const scheduledSummary = this.summarizeRuntimeTimestamp(scheduled.lastFinishedAt || scheduled.lastStartedAt || scheduled.lastErrorAt, '最近调度：');
+        const scheduledLines = [
+          scheduled.lastStartedAt ? ('最近开始：' + this.formatLocalDateTime(scheduled.lastStartedAt)) : '',
+          scheduled.lastFinishedAt ? ('最近结束：' + this.formatLocalDateTime(scheduled.lastFinishedAt)) : '',
+          cleanup.status ? ('日志清理：' + this.formatRuntimeStateText(cleanup.status) + (cleanup.lastSuccessAt ? '（' + this.formatLocalDateTime(cleanup.lastSuccessAt) + '）' : cleanup.lastSkippedAt ? '（' + this.formatLocalDateTime(cleanup.lastSkippedAt) + '）' : cleanup.lastErrorAt ? '（' + this.formatLocalDateTime(cleanup.lastErrorAt) + '）' : '')) : '',
+          report.status ? ('日报发送：' + this.formatRuntimeStateText(report.status) + (report.lastSuccessAt ? '（' + this.formatLocalDateTime(report.lastSuccessAt) + '）' : report.lastSkippedAt ? '（' + this.formatLocalDateTime(report.lastSkippedAt) + '）' : report.lastErrorAt ? '（' + this.formatLocalDateTime(report.lastErrorAt) + '）' : '')) : ''
+        ].filter(Boolean);
+        const scheduledDetail = scheduled.lastError || cleanup.lastError || report.lastError
+          ? ('最近调度错误：' + (scheduled.lastError || cleanup.lastError || report.lastError))
+          : '';
+        const scheduledCard = document.getElementById('dash-runtime-scheduled-card');
+        if (scheduledCard) {
+          scheduledCard.innerHTML = this.buildRuntimeStatusCard('定时任务', scheduled.status || 'idle', scheduledSummary, scheduledLines, scheduledDetail);
+        }
+      },
+
+      renderRuntimeStatusError(message) {
+        const updated = document.getElementById('dash-runtime-updated');
+        if (updated) updated.textContent = '最近同步：运行状态加载失败';
+        const errorMessage = message || '未知错误';
+        const logCard = document.getElementById('dash-runtime-log-card');
+        if (logCard) {
+          logCard.innerHTML = this.buildRuntimeStatusCard('日志写入', 'failed', '运行状态接口暂时不可用', [], errorMessage);
+        }
+        const scheduledCard = document.getElementById('dash-runtime-scheduled-card');
+        if (scheduledCard) {
+          scheduledCard.innerHTML = this.buildRuntimeStatusCard('定时任务', 'failed', '运行状态接口暂时不可用', [], errorMessage);
+        }
+      },
+      
+      async apiCall(action, payload={}) {
+          const requestInit = {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({action, ...payload})
+          };
+          let res = await fetch('/admin', requestInit);
+          if (res.status === 401) {
+              await this.promptLogin();
+              res = await fetch('/admin', requestInit);
+          }
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error?.message || ('HTTP ' + res.status));
+          return data;
+      },
+
+      toggleSidebar() {
+        const sb = document.getElementById('sidebar');
+        const bd = document.getElementById('sidebar-backdrop');
+        sb.classList.toggle('-translate-x-full');
+        if(sb.classList.contains('-translate-x-full')) bd.classList.add('hidden');
+        else bd.classList.remove('hidden');
+      },
+      
+      route() {
+        const hash = window.location.hash || '#dashboard';
+        document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
+        document.querySelectorAll('.nav-item').forEach(el => { el.classList.remove('bg-brand-50', 'text-brand-600', 'dark:bg-brand-500/10', 'dark:text-brand-400'); });
+
+        const view = document.getElementById('view-' + hash.replace('#',''));
+        if (view) view.classList.add('active');
+
+        const activeNav = document.querySelector('a[href="' + hash + '"]');
+        if (activeNav) activeNav.classList.add('bg-brand-50', 'text-brand-600', 'dark:bg-brand-500/10', 'dark:text-brand-400');
+
+        const titles = {'#dashboard':'仪表盘', '#nodes':'节点列表', '#logs':'日志记录', '#settings':'全局设置'};
+        document.getElementById('page-title').textContent = titles[hash] || 'Emby Proxy';
+
+        // 移动端体验优化：切换菜单后自动收起侧边栏
+        const sb = document.getElementById('sidebar');
+        if (sb && !sb.classList.contains('-translate-x-full') && window.innerWidth < 768) {
+            this.toggleSidebar();
+        }
+
+        if (hash === '#dashboard') this.loadDashboard();
+        if (hash === '#nodes') this.loadNodes();
+        if (hash === '#logs') this.loadLogs(1);
+        if (hash === '#settings') this.loadSettings();
+      },
+
+      switchSetTab(event, id) {
+        document.querySelectorAll('.set-tab').forEach(el => {
+          el.classList.remove('bg-brand-50', 'text-brand-600', 'dark:bg-brand-500/10', 'dark:text-brand-400');
+          el.classList.add('text-slate-500');
+        });
+        if (event && event.currentTarget) event.currentTarget.classList.add('bg-brand-50', 'text-brand-600', 'dark:bg-brand-500/10', 'dark:text-brand-400');
+        document.querySelectorAll('#settings-forms > div').forEach(el => el.classList.add('hidden'));
+        document.getElementById('set-' + id).classList.remove('hidden');
+      },
+
+      renderDashboardStats(data) {
+         document.getElementById('dash-req-count').textContent = data.todayRequests || 0;
+         document.getElementById('dash-traffic-count').textContent = data.todayTraffic || '0 B';
+         document.getElementById('dash-node-count').textContent = data.nodeCount || 0;
+         const reqHint = document.getElementById('dash-req-hint');
+         if (reqHint) {
+           const hint = data.requestSourceText || '今日请求量口径：未知';
+           reqHint.textContent = hint || ' ';
+           reqHint.title = [data.requestSourceText || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
+         }
+         const reqCount = document.getElementById('dash-req-count');
+         if (reqCount) reqCount.title = [data.requestSourceText || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
+         this.renderDashboardBadges('dash-req-meta', [
+           this.getRequestSourceBadge(data),
+           this.getStatsFreshnessBadge(data)
+         ]);
+
+         const embyMetrics = document.getElementById('dash-emby-metrics');
+         if (embyMetrics) {
+             let accSecs = Math.floor((data.totalAccMs || 0) / 1000);
+             let accHrs = Math.floor(accSecs / 3600);
+             let accMins = Math.floor((accSecs % 3600) / 60);
+             let accRemSecs = accSecs % 60;
+             embyMetrics.textContent = '请求: 播放请求 ' + (data.playCount || 0) + ' 次 | 获取播放信息 ' + (data.infoCount || 0) + ' 次 ，共加速时长: ' + accHrs + '小时' + accMins + '分钟' + accRemSecs + '秒';
+         }
+
+         const trafficHint = document.getElementById('dash-traffic-hint');
+         if (trafficHint) {
+           const hint = data.trafficSourceText || data.cfAnalyticsStatus || data.cfAnalyticsError || '';
+           trafficHint.textContent = hint || ' ';
+           trafficHint.title = [data.trafficSourceText || '', data.cfAnalyticsStatus || '', data.cfAnalyticsError || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
+         }
+         const trafficDetail = document.getElementById('dash-traffic-detail');
+         if (trafficDetail) {
+           const detailLines = [data.cfAnalyticsStatus, data.cfAnalyticsError, data.cfAnalyticsDetail].filter(Boolean);
+           trafficDetail.textContent = detailLines.length ? detailLines.join('\\n') : ' ';
+         }
+         const trafficCount = document.getElementById('dash-traffic-count');
+         if (trafficCount) trafficCount.title = [data.trafficSourceText || '', data.cfAnalyticsStatus || '', data.cfAnalyticsError || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
+         this.renderDashboardBadges('dash-traffic-meta', [
+           this.getTrafficStatusBadge(data),
+           this.getStatsFreshnessBadge(data)
+         ]);
+         const nodeMeta = document.getElementById('dash-node-meta');
+         if (nodeMeta) {
+           nodeMeta.textContent = '统计时间：' + this.formatLocalDateTime(data.generatedAt);
+         }
+         this.renderDashboardBadges('dash-node-badges', [
+           { label: '节点索引: 已加载', tone: 'emerald' },
+           this.getStatsFreshnessBadge(data)
+         ]);
+         this.dashboardSeries = Array.isArray(data.hourlySeries) ? data.hourlySeries : [];
+         this.renderChart();
+      },
+
+      renderDashboardError(message) {
+         document.getElementById('dash-req-count').textContent = '0';
+         document.getElementById('dash-traffic-count').textContent = '0 B';
+         document.getElementById('dash-node-count').textContent = '0';
+         this.dashboardSeries = [];
+         this.renderChart();
+         const reqHint = document.getElementById('dash-req-hint');
+         if (reqHint) reqHint.textContent = '加载仪表盘失败';
+         const trafficHint = document.getElementById('dash-traffic-hint');
+         if (trafficHint) trafficHint.textContent = '加载仪表盘失败';
+         const trafficDetail = document.getElementById('dash-traffic-detail');
+         if (trafficDetail) trafficDetail.textContent = message || '未知错误';
+         const nodeMeta = document.getElementById('dash-node-meta');
+         if (nodeMeta) nodeMeta.textContent = '统计时间：不可用';
+         this.renderDashboardBadges('dash-req-meta', [{ label: '请求口径: 加载失败', tone: 'red' }]);
+         this.renderDashboardBadges('dash-traffic-meta', [{ label: '流量状态: 加载失败', tone: 'red' }]);
+         this.renderDashboardBadges('dash-node-badges', [{ label: '节点索引: 未确认', tone: 'red' }]);
+      },
+
+      async loadDashboard() {
+         const loadSeq = ++this.dashboardLoadSeq;
+         const [statsResult, runtimeResult] = await Promise.allSettled([
+           this.apiCall('getDashboardStats'),
+           this.apiCall('getRuntimeStatus')
+         ]);
+         if (loadSeq !== this.dashboardLoadSeq) return;
+
+         if (statsResult.status === 'fulfilled') {
+           this.renderDashboardStats(statsResult.value);
+         } else {
+           this.renderDashboardError(statsResult.reason?.message || '未知错误');
+         }
+
+         if (runtimeResult.status === 'fulfilled') {
+           this.renderRuntimeStatus(runtimeResult.value.status || {});
+         } else {
+           this.renderRuntimeStatusError(runtimeResult.reason?.message || '未知错误');
+         }
+      },
+
+      renderChart() {
+        const ctx = document.getElementById('trafficChart');
+        if (!ctx) return;
+        if (this.chart) this.chart.destroy();
+        const fallbackSeries = Array.from({ length: 24 }, (_, hour) => ({ label: String(hour).padStart(2, '0') + ':00', total: 0 }));
+        const series = this.dashboardSeries.length ? this.dashboardSeries : fallbackSeries;
+        this.chart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: series.map(item => item.label),
+            datasets: [{ label: '请求趋势', data: series.map(item => item.total), borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.1)', fill: true, tension: 0.35 }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+              y: { min: 0, suggestedMax: 10, ticks: { precision: 0 }, title: { display: true, text: '请求总次数' } },
+              x: { title: { display: true, text: '小时（UTC+8）' } }
+            }
+          }
+        });
+      },
+
+      async loadSettings() {
+          const [configRes, nodesRes] = await Promise.all([
+              this.apiCall('loadConfig'),
+              this.apiCall('list').catch(() => ({ nodes: this.nodes || [] }))
+          ]);
+          const cfg = configRes.config || { enableH2: false, enableH3: false, peakDowngrade: true, protocolFallback: true, sourceSameOriginProxy: true, forceExternalProxy: true };
+          if (Array.isArray(nodesRes.nodes)) this.nodes = nodesRes.nodes;
+          
+          document.getElementById('cfg-enable-h2').checked = !!cfg.enableH2;
+          document.getElementById('cfg-enable-h3').checked = !!cfg.enableH3;
+          document.getElementById('cfg-peak-downgrade').checked = cfg.peakDowngrade !== false; 
+          document.getElementById('cfg-protocol-fallback').checked = cfg.protocolFallback !== false; 
+          document.getElementById('cfg-source-same-origin-proxy').checked = cfg.sourceSameOriginProxy !== false;
+          document.getElementById('cfg-enable-prewarm').checked = cfg.enablePrewarm !== false;
+          document.getElementById('cfg-prewarm-ttl').value = cfg.prewarmCacheTtl || 180;
+          document.getElementById('cfg-force-external-proxy').checked = cfg.forceExternalProxy !== false;
+          document.getElementById('cfg-wangpandirect').value = cfg.wangpandirect || '${DEFAULT_WANGPAN_DIRECT_TEXT}';
+          document.getElementById('cfg-direct-node-search').value = '';
+          this.settingsSourceDirectNodes = this.normalizeNodeNameList(cfg.sourceDirectNodes || cfg.directSourceNodes || cfg.nodeDirectList || []);
+          this.renderSourceDirectNodesPicker(this.settingsSourceDirectNodes);
+          document.getElementById('cfg-ping-timeout').value = cfg.pingTimeout || 5000;
+          
+          document.getElementById('cfg-geo-allow').value = cfg.geoAllowlist || '';
+          document.getElementById('cfg-geo-block').value = cfg.geoBlocklist || '';
+          document.getElementById('cfg-ip-black').value = cfg.ipBlacklist || '';
+          document.getElementById('cfg-rate-limit').value = cfg.rateLimitRpm || '';
+          document.getElementById('cfg-cache-ttl').value = cfg.cacheTtlImages || 30;
+          document.getElementById('cfg-cors').value = cfg.corsOrigins || '';
+          
+          document.getElementById('cfg-log-days').value = cfg.logRetentionDays || 7;
+          document.getElementById('cfg-log-delay').value = Number.isFinite(Number(cfg.logWriteDelayMinutes)) ? Number(cfg.logWriteDelayMinutes) : 20;
+          document.getElementById('cfg-log-flush-count').value = Number.isFinite(Number(cfg.logFlushCountThreshold)) ? Number(cfg.logFlushCountThreshold) : 50;
+          document.getElementById('cfg-tg-token').value = cfg.tgBotToken || '';
+          document.getElementById('cfg-tg-chatid').value = cfg.tgChatId || '';
+          
+          document.getElementById('cfg-jwt-days').value = cfg.jwtExpiryDays || 30;
+          document.getElementById('cfg-cf-account').value = cfg.cfAccountId || '';
+          document.getElementById('cfg-cf-zone').value = cfg.cfZoneId || '';
+          document.getElementById('cfg-cf-token').value = cfg.cfApiToken || '';
+      },
+
+      async saveSettings(section) {
+          const res = await this.apiCall('loadConfig');
+          let newConfig = res.config || {};
+          
+          if(section === 'proxy') {
+              newConfig.enableH2 = document.getElementById('cfg-enable-h2').checked;
+              newConfig.enableH3 = document.getElementById('cfg-enable-h3').checked;
+              newConfig.peakDowngrade = document.getElementById('cfg-peak-downgrade').checked;
+              newConfig.protocolFallback = document.getElementById('cfg-protocol-fallback').checked;
+              newConfig.enablePrewarm = document.getElementById('cfg-enable-prewarm').checked;
+              newConfig.prewarmCacheTtl = parseInt(document.getElementById('cfg-prewarm-ttl').value) || 180;
+              newConfig.sourceSameOriginProxy = document.getElementById('cfg-source-same-origin-proxy').checked;
+              newConfig.forceExternalProxy = document.getElementById('cfg-force-external-proxy').checked;
+              newConfig.wangpandirect = document.getElementById('cfg-wangpandirect').value.trim();
+              newConfig.sourceDirectNodes = this.normalizeNodeNameList(this.settingsSourceDirectNodes);
+              newConfig.pingTimeout = parseInt(document.getElementById('cfg-ping-timeout').value) || 5000;
+          } else if(section === 'security') {
+              newConfig.geoAllowlist = document.getElementById('cfg-geo-allow').value;
+              newConfig.geoBlocklist = document.getElementById('cfg-geo-block').value;
+              newConfig.ipBlacklist = document.getElementById('cfg-ip-black').value;
+              newConfig.rateLimitRpm = parseInt(document.getElementById('cfg-rate-limit').value) || 0;
+              newConfig.cacheTtlImages = parseInt(document.getElementById('cfg-cache-ttl').value) || 30;
+              newConfig.corsOrigins = document.getElementById('cfg-cors').value;
+          } else if(section === 'logs') {
+              newConfig.logRetentionDays = parseInt(document.getElementById('cfg-log-days').value) || 7;
+              const logDelayMinutes = parseFloat(document.getElementById('cfg-log-delay').value);
+              const logFlushCountThreshold = parseInt(document.getElementById('cfg-log-flush-count').value, 10);
+              newConfig.logWriteDelayMinutes = Number.isFinite(logDelayMinutes) ? Math.max(0, logDelayMinutes) : 20;
+              newConfig.logFlushCountThreshold = Number.isFinite(logFlushCountThreshold) ? Math.max(1, logFlushCountThreshold) : 50;
+              newConfig.tgBotToken = document.getElementById('cfg-tg-token').value.trim();
+              newConfig.tgChatId = document.getElementById('cfg-tg-chatid').value.trim();
+          } else if(section === 'account') {
+              newConfig.jwtExpiryDays = parseInt(document.getElementById('cfg-jwt-days').value) || 30;
+              newConfig.cfAccountId = document.getElementById('cfg-cf-account').value.trim();
+              newConfig.cfZoneId = document.getElementById('cfg-cf-zone').value.trim();
+              newConfig.cfApiToken = document.getElementById('cfg-cf-token').value.trim();
+          }
+          
+          await this.apiCall('saveConfig', { config: newConfig });
+          alert("设置已保存，立即生效");
+      },
+      
+      async testTelegram() {
+          const botToken = document.getElementById('cfg-tg-token').value.trim();
+          const chatId = document.getElementById('cfg-tg-chatid').value.trim();
+          
+          if (!botToken || !chatId) {
+              alert("请先填写完整的 Telegram Bot Token 和 Chat ID！");
+              return;
+          }
+          
+          const res = await this.apiCall('testTelegram', { tgBotToken: botToken, tgChatId: chatId });
+          if (res.success) {
+              alert("测试通知已发送！请查看您的 Telegram 客户端。");
+          } else {
+              alert("发送失败: " + (res.error?.message || "未知网络错误"));
+          }
+      },
+      
+      async sendDailyReport() {
+          try {
+              const res = await this.apiCall('sendDailyReport');
+              if (res.success) {
+                  alert("日报已成功生成并发送到 Telegram！");
+              } else {
+                  alert("发送失败: " + (res.error?.message || "未知网络错误"));
+              }
+          } catch(e) {
+              alert("发送失败: " + e.message);
+          }
+      },
+
+      async purgeCache() {
+          const res = await this.apiCall('purgeCache');
+          if (res.success) alert("边缘缓存已成功清空！");
+          else alert("清空失败: " + (res.error?.message || "请检查 Zone ID 和 Token"));
+      },
+
+      async loadNodes() {
+          const res = await this.apiCall('list');
+          if(res.nodes) { this.nodes = res.nodes; this.renderNodesGrid(); }
+      },
+
+      async forceHealthCheck(event) {
+          const btn = event.currentTarget;
+          const originalHtml = btn.innerHTML;
+          btn.innerHTML = \`<i data-lucide="loader" class="w-4 h-4 mr-2 animate-spin"></i> 探测中...\`;
+          this.safeCreateIcons({root: btn.parentElement});
+          await this.checkAllNodesHealth();
+          btn.innerHTML = originalHtml;
+          this.safeCreateIcons({root: btn.parentElement});
+      },
+
+      async checkSingleNodeHealth(name, btnEl) {
+          const originalHtml = btnEl.innerHTML;
+          // 修复：使用单引号，防止截断外部的 UI_HTML 模板字符串
+          btnEl.innerHTML = '<i data-lucide="loader" class="w-4 h-4 animate-spin"></i>';
+          this.safeCreateIcons({root: btnEl.parentElement});
+          
+          try {
+             // 🌟 走 Worker API 测算真实的 CF 边缘到源站延迟
+             const timeout = parseInt(document.getElementById('cfg-ping-timeout')?.value) || 5000;
+             const res = await this.apiCall('pingNode', { name, timeout });
+             this.updateNodeCardStatus(name, res.ms || 9999);
+          } catch(e) {
+             this.updateNodeCardStatus(name, 9999);
+          }
+          
+          btnEl.innerHTML = originalHtml;
+          this.safeCreateIcons({root: btnEl.parentElement});
+      },
+
+      async checkAllNodesHealth() {
+          const timeout = parseInt(document.getElementById('cfg-ping-timeout')?.value) || 5000;
+          for(let n of this.nodes) {
+             try {
+                const res = await this.apiCall('pingNode', { name: n.name, timeout });
+                this.updateNodeCardStatus(n.name, res.ms || 9999);
+             } catch(e) {
+                this.updateNodeCardStatus(n.name, 9999);
+             }
+          }
+      },
+      
+      updateNodeCardStatus(name, ms) {
+          const dot = document.getElementById(this.safeDomId('dot', name));
+          const title = document.getElementById(this.safeDomId('title', name));
+          const txt = document.getElementById(this.safeDomId('lat', name));
+          if (!dot || !title || !txt) return;
+
+          // 清除旧的内联样式
+          dot.style.backgroundColor = '';
+          dot.style.boxShadow = '';
+
+          const baseDot = 'w-3 h-3 rounded-full mr-3 transition-colors duration-500 flex-shrink-0 ';
+          let colorClass = '';
+          let txtClass = '';
+
+          if (ms <= 150) {
+              colorClass = 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)] dark:shadow-[0_0_8px_rgba(52,211,153,0.4)]';
+              txtClass = 'text-emerald-600 dark:text-emerald-400 font-medium';
+          } else if (ms <= 200) {
+              colorClass = 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)] dark:shadow-[0_0_8px_rgba(251,191,36,0.4)]';
+              txtClass = 'text-amber-600 dark:text-amber-400 font-medium';
+          } else if (ms <= 300) {
+              colorClass = 'bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.6)] dark:shadow-[0_0_8px_rgba(251,146,60,0.4)]';
+              txtClass = 'text-orange-600 dark:text-orange-400 font-medium';
+          } else {
+              colorClass = 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)] dark:shadow-[0_0_8px_rgba(248,113,113,0.4)]';
+              txtClass = 'text-red-600 dark:text-red-400 font-medium';
+          }
+
+          dot.className = baseDot + colorClass;
+          txt.className = txtClass;
+          txt.textContent = ms > 5000 ? 'Timeout' : (ms + ' ms');
+
+          if (ms > 300) this.nodeHealth[name] = (this.nodeHealth[name] || 0) + 1;
+          else this.nodeHealth[name] = 0;
+          
+          if (this.nodeHealth[name] > 3) title.classList.add('text-red-600', 'dark:text-red-400');
+          else title.classList.remove('text-red-500', 'text-red-600', 'dark:text-red-400');
+      },
+
+      renderNodesGrid() {
+        const keyword = document.getElementById('node-search')?.value.toLowerCase() || '';
+        const filteredNodes = this.nodes.filter(n => n.name.toLowerCase().includes(keyword) || (n.tag && n.tag.toLowerCase().includes(keyword)));
+        const grid = document.getElementById('nodes-grid');
+        grid.innerHTML = '';
+
+        if (!filteredNodes.length) {
+          const empty = document.createElement('div');
+          empty.className = 'col-span-full py-12 text-center text-slate-500';
+          empty.textContent = '暂无匹配节点';
+          grid.appendChild(empty);
+          return;
+        }
+
+        const fragment = document.createDocumentFragment();
+        filteredNodes.forEach(n => {
+          const link = this.buildNodeLink(n);
+          const dotId = this.safeDomId('dot', n.name);
+          const titleId = this.safeDomId('title', n.name);
+          const latId = this.safeDomId('lat', n.name);
+          const linkId = this.safeDomId('link', n.name);
+
+          const card = document.createElement('div');
+          card.className = 'glass-card p-6 rounded-3xl flex flex-col justify-between';
+
+          const top = document.createElement('div');
+          const headerRow = document.createElement('div');
+          headerRow.className = 'flex items-center mb-1 w-full';
+          const dot = document.createElement('span');
+          dot.id = dotId;
+          // 使用 Tailwind 设置默认的中性灰/暗灰，并加上内阴影
+          dot.className = 'w-3 h-3 rounded-full mr-3 bg-slate-200 dark:bg-slate-700 transition-colors duration-500 flex-shrink-0 shadow-inner';
+          const title = document.createElement('h3');
+          title.id = titleId;
+          title.className = 'font-semibold text-lg transition-colors flex-1 min-w-0 truncate';
+          title.textContent = n.name;
+          headerRow.appendChild(dot);
+          headerRow.appendChild(title);
+
+          const metaRow = document.createElement('div');
+          metaRow.className = 'text-xs text-slate-400 mb-2 flex justify-between tracking-wider';
+          const pingLabel = document.createElement('span');
+          pingLabel.textContent = 'Ping: ';
+          const pingValue = document.createElement('span');
+          pingValue.id = latId;
+          pingValue.textContent = '--';
+          // 使用 Tailwind 统一设置文本样式
+          pingValue.className = 'text-slate-500 dark:text-slate-400 font-medium';
+          pingLabel.appendChild(pingValue);
+          const shield = document.createElement('span');
+          shield.className = 'truncate ml-2 text-right';
+          const shieldIcon = document.createElement('i');
+          shieldIcon.setAttribute('data-lucide', 'shield');
+          shieldIcon.className = 'w-3 h-3 inline';
+          shield.appendChild(shieldIcon);
+          shield.appendChild(document.createTextNode(' ' + (n.secret ? '已防护' : '未防护')));
+          metaRow.appendChild(pingLabel);
+          metaRow.appendChild(shield);
+
+          const detailWrap = document.createElement('div');
+          detailWrap.className = 'text-xs text-slate-500 dark:text-slate-400 mb-3 space-y-1';
+          const tagRow = document.createElement('div');
+          tagRow.className = 'flex items-center min-w-0';
+          const tagIcon = document.createElement('i');
+          tagIcon.setAttribute('data-lucide', 'tag');
+          tagIcon.className = 'w-3 h-3 mr-1.5 flex-shrink-0 text-brand-500';
+          const tagText = document.createElement('span');
+          tagText.className = 'truncate flex-1 min-w-0';
+          tagText.textContent = n.tag || '无标签';
+          tagRow.appendChild(tagIcon);
+          tagRow.appendChild(tagText);
+          const remarkRow = document.createElement('div');
+          remarkRow.className = 'flex items-center min-w-0';
+          const remarkIcon = document.createElement('i');
+          remarkIcon.setAttribute('data-lucide', 'file-text');
+          remarkIcon.className = 'w-3 h-3 mr-1.5 flex-shrink-0 text-purple-500';
+          const remarkText = document.createElement('span');
+          remarkText.className = 'truncate flex-1 min-w-0';
+          remarkText.textContent = n.remark || '无备注';
+          remarkRow.appendChild(remarkIcon);
+          remarkRow.appendChild(remarkText);
+          detailWrap.appendChild(tagRow);
+          detailWrap.appendChild(remarkRow);
+
+          top.appendChild(headerRow);
+          top.appendChild(metaRow);
+          top.appendChild(detailWrap);
+
+          const bottom = document.createElement('div');
+          const linkWrap = document.createElement('div');
+          linkWrap.className = 'flex items-center bg-slate-100 dark:bg-slate-800 p-2 rounded-xl mb-4 border border-slate-200 dark:border-slate-700';
+          const linkInput = document.createElement('input');
+          linkInput.type = 'password';
+          linkInput.id = linkId;
+          linkInput.readOnly = true;
+          linkInput.value = link;
+          linkInput.className = 'bg-transparent border-none flex-1 min-w-0 text-xs outline-none text-slate-600 dark:text-slate-300';
+          const toggleBtn = document.createElement('button');
+          toggleBtn.type = 'button';
+          toggleBtn.className = 'text-slate-400 hover:text-brand-500 ml-2';
+          const toggleIcon = document.createElement('i');
+          toggleIcon.setAttribute('data-lucide', 'eye');
+          toggleIcon.className = 'w-4 h-4';
+          toggleBtn.appendChild(toggleIcon);
+          toggleBtn.addEventListener('click', () => {
+            linkInput.type = linkInput.type === 'password' ? 'text' : 'password';
+          });
+          linkWrap.appendChild(linkInput);
+          linkWrap.appendChild(toggleBtn);
+
+          const actions = document.createElement('div');
+          actions.className = 'flex gap-2';
+
+          const pingBtn = document.createElement('button');
+          pingBtn.type = 'button';
+          pingBtn.className = 'px-3 border border-emerald-200 dark:border-emerald-800/50 text-emerald-600 dark:text-emerald-400 rounded-xl hover:bg-emerald-50 dark:hover:bg-emerald-900/30 transition flex items-center justify-center flex-shrink-0';
+          pingBtn.title = '独立节点测速';
+          const pingIconBtn = document.createElement('i');
+          pingIconBtn.setAttribute('data-lucide', 'activity');
+          pingIconBtn.className = 'w-4 h-4';
+          pingBtn.appendChild(pingIconBtn);
+          pingBtn.addEventListener('click', (event) => this.checkSingleNodeHealth(n.name, event.currentTarget));
+
+          const copyBtn = document.createElement('button');
+          copyBtn.type = 'button';
+          copyBtn.className = 'flex-1 py-2 text-sm font-medium border border-slate-200 dark:border-slate-700 rounded-xl hover:bg-slate-50 dark:hover:bg-slate-800 transition';
+          copyBtn.textContent = '复制';
+          copyBtn.addEventListener('click', async () => {
+            try {
+              await navigator.clipboard.writeText(link);
+              alert('链接已复制到剪贴板');
+            } catch {
+              alert('复制失败，请手动复制');
+            }
+          });
+
+          const editBtn = document.createElement('button');
+          editBtn.type = 'button';
+          editBtn.className = 'flex-1 py-2 text-sm font-medium bg-brand-50 text-brand-600 dark:bg-brand-500/10 dark:text-brand-400 rounded-xl hover:bg-brand-100 dark:hover:bg-brand-500/20 transition';
+          editBtn.textContent = '编辑';
+          editBtn.addEventListener('click', () => this.showNodeModal(n.name));
+
+          const deleteBtn = document.createElement('button');
+          deleteBtn.type = 'button';
+          deleteBtn.className = 'px-3 border border-red-100 dark:border-red-900/30 text-red-500 rounded-xl hover:bg-red-50 dark:hover:bg-red-900/20 transition flex items-center justify-center flex-shrink-0';
+          const deleteIcon = document.createElement('i');
+          deleteIcon.setAttribute('data-lucide', 'trash-2');
+          deleteIcon.className = 'w-4 h-4';
+          deleteBtn.appendChild(deleteIcon);
+          deleteBtn.addEventListener('click', () => {
+            if (confirm('删除节点?')) this.deleteNode(n.name);
+          });
+
+          actions.appendChild(pingBtn);
+          actions.appendChild(copyBtn);
+          actions.appendChild(editBtn);
+          actions.appendChild(deleteBtn);
+
+          bottom.appendChild(linkWrap);
+          bottom.appendChild(actions);
+
+          card.appendChild(top);
+          card.appendChild(bottom);
+          fragment.appendChild(card);
+        });
+
+        grid.appendChild(fragment);
+        this.safeCreateIcons({root: grid});
+      },
+
+      addHeaderRow(key = '', val = '') {
+          const div = document.createElement('div');
+          div.className = 'flex gap-2 items-center';
+
+          const keyInput = document.createElement('input');
+          keyInput.type = 'text';
+          keyInput.placeholder = 'Name (e.g. User-Agent)';
+          keyInput.value = key;
+          keyInput.className = 'header-key flex-1 min-w-0 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm font-mono text-slate-900 dark:text-white';
+
+          const valInput = document.createElement('input');
+          valInput.type = 'text';
+          valInput.placeholder = 'Value';
+          valInput.value = val;
+          valInput.className = 'header-val flex-1 min-w-0 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm font-mono text-slate-900 dark:text-white';
+
+          const removeBtn = document.createElement('button');
+          removeBtn.type = 'button';
+          removeBtn.className = 'text-red-500 p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition';
+          const removeIcon = document.createElement('i');
+          removeIcon.setAttribute('data-lucide', 'x');
+          removeIcon.className = 'w-4 h-4';
+          removeBtn.appendChild(removeIcon);
+          removeBtn.addEventListener('click', () => div.remove());
+
+          div.appendChild(keyInput);
+          div.appendChild(valInput);
+          div.appendChild(removeBtn);
+          document.getElementById('headers-container').appendChild(div);
+          this.safeCreateIcons({root: div});
+      },
+
+      showNodeModal(name='') {
+        document.getElementById('node-modal-title').textContent = name ? '编辑节点' : '新建节点';
+        const form = document.querySelector('#node-modal form'); form.reset();
+        document.getElementById('headers-container').innerHTML = ''; 
+        
+        if(name) {
+            const n = this.nodes.find(x => String(x.name) === String(name));
+            if(n) {
+                document.getElementById('form-original-name').value = n.name; 
+                document.getElementById('form-name').value = n.name;
+                document.getElementById('form-name').readOnly = false; 
+                document.getElementById('form-target').value = n.target;
+                document.getElementById('form-secret').value = n.secret || ''; 
+                document.getElementById('form-tag').value = n.tag || '';
+                document.getElementById('form-remark').value = n.remark || ''; 
+                
+                if (n.headers && typeof n.headers === 'object') {
+                    for (const [k, v] of Object.entries(n.headers)) {
+                        this.addHeaderRow(k, v);
                     }
-
-                    // [修复] 保持路径完整性
-                    if (url.pathname.endsWith('/') && remaining !== '/') {
-                        remaining += '/';
-                    }
-
-                    if (remaining === "") remaining = "/";
-
-                    // -------------------------------------------------------------
-                    // API 优先策略 (优化版: 放行静态资源)
-                    // -------------------------------------------------------------
-                    const lowerPath = remaining.toLowerCase();
-                    
-                    // [优化] 增加静态资源后缀排除，避免拦截 css/js 导致页面样式崩坏
-                    const isStaticAsset = /\.(?:js|css|png|jpg|jpeg|gif|ico|svg|woff2?|ttf|map)$/i.test(lowerPath);
-                    
-                    const isWebClient = lowerPath.startsWith('/web') && 
-                                      !lowerPath.includes('/emby/ping') && 
-                                      !lowerPath.includes('/emby/system/info') &&
-                                      !isStaticAsset; 
-
-                    if (isWebClient) {
-                        const urlParams = new URL(request.url).searchParams;
-                        const cookie = request.headers.get("Cookie") || "";
-                        
-                        // 1. 如果 URL 带了 ?backup=1，植入 Cookie 并重定向
-                        if (urlParams.get('backup') === '1') {
-                            const cleanUrl = new URL(request.url);
-                            cleanUrl.searchParams.delete('backup');
-                            return new Response(null, {
-                                status: 302,
-                                headers: {
-                                    "Location": cleanUrl.toString(),
-                                    // [修改点] Max-Age=86400 (1天)
-                                    "Set-Cookie": "emby_web_bypass=1; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax"
-                                }
-                            });
-                        }
-
-                        // 2. 检查是否有 Bypass Cookie
-                        const hasCookie = cookie.includes("emby_web_bypass=1");
-
-                        // 3. 如果既没参数也没 Cookie，则拦截
-                        if (!hasCookie) {
-                            const backupUrl = new URL(request.url);
-                            backupUrl.searchParams.set('backup', '1');
-
-                            return new Response(UI.getHead("Web Access Restricted") + `
-                                <body>
-                                    <div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;text-align:center;padding:20px">
-                                        <div class="panel" style="padding:40px;max-width:420px;box-shadow:0 10px 40px rgba(0,0,0,0.3)">
-                                            <div style="font-size:48px;margin-bottom:20px">🔒</div>
-                                            <h2 style="color:var(--t);margin:0 0 10px 0">API 优先模式</h2>
-                                            <p style="color:var(--ts);font-size:14px;line-height:1.6;margin-bottom:25px">
-                                                Web 客户端访问已被默认限制。<br>
-                                                请使用客户端以获得最佳体验。
-                                            </p>
-                                            
-                                            <hr>
-                                            <a href="${backupUrl.href}" class="btn btn-p" style="display:block;width:100%;text-decoration:none;padding:12px;box-sizing:border-box">
-                                                启用 Web 备用模式 (24小时) </a>
-                                        </div>
-                                    </div>
-                                </body></html>
-                            `, { 
-                                status: 403, 
-                                headers: { "Content-Type": "text/html;charset=utf-8" } 
-                            });
-                        }
-                    }
-
-                    // 5. 透传请求给 Emby
-                    return Proxy.handle(request, nodeData, remaining, root, secret, env, ctx);
                 }
             }
+        } else {
+            document.getElementById('form-original-name').value = '';
+            this.addHeaderRow(); 
+        }
+        document.getElementById('node-modal').showModal();
+      },
+      
+      async saveNode(e) {
+          e.preventDefault();
+          const form = e.currentTarget;
+          const submitBtn = e.submitter || form?.querySelector('button[type="submit"]');
+          const originalBtnText = submitBtn ? submitBtn.innerHTML : '';
+          let headersObj = {};
+          const hKeys = document.querySelectorAll('.header-key');
+          const hVals = document.querySelectorAll('.header-val');
+          for(let i = 0; i < hKeys.length; i++) {
+              const k = hKeys[i].value.trim();
+              const v = hVals[i].value.trim();
+              if(k) headersObj[k] = v;
+          }
+          
+          const payload = {
+              originalName: document.getElementById('form-original-name').value,
+              name: document.getElementById('form-name').value.trim(),
+              target: document.getElementById('form-target').value.trim(),
+              secret: document.getElementById('form-secret').value.trim(),
+              tag: document.getElementById('form-tag').value.trim(),
+              remark: document.getElementById('form-remark').value.trim(),
+              headers: headersObj
+          };
+
+          if (!this.validateTargets(payload.target)) {
+              alert('目标源站必须是有效的 http/https URL，多个源站请用英文逗号分隔');
+              return;
+          }
+
+          if (submitBtn) {
+              submitBtn.disabled = true;
+              submitBtn.innerHTML = '保存中...';
+          }
+
+          const originalNameKey = this.normalizeNodeKey(payload.originalName);
+          const optimisticNameKey = this.normalizeNodeKey(payload.name);
+          const mutationNames = [payload.originalName, payload.name];
+          const mutationId = this.markNodeMutation(mutationNames);
+          const optimisticIdx = this.nodes.findIndex(n => {
+              const currentName = this.normalizeNodeKey(n?.name);
+              return currentName === originalNameKey || currentName === optimisticNameKey;
+          });
+          const previousNode = optimisticIdx > -1 ? this.nodes[optimisticIdx] : null;
+          const optimisticNode = {
+              ...(previousNode || {}),
+              name: payload.name,
+              target: payload.target,
+              secret: payload.secret,
+              tag: payload.tag,
+              remark: payload.remark,
+              headers: payload.headers
+          };
+
+          if (optimisticIdx > -1) {
+              this.nodes[optimisticIdx] = optimisticNode;
+          } else {
+              this.nodes.push(optimisticNode);
+          }
+
+          document.getElementById('node-modal').close();
+          this.renderNodesGrid();
+
+          this.apiCall('save', payload).then(res => {
+              if (!this.isNodeMutationCurrent([...mutationNames, res?.node?.name], mutationId)) return;
+              if (res && res.node) {
+                  const finalIdx = this.nodes.findIndex(n =>
+                      this.normalizeNodeKey(n?.name) === this.normalizeNodeKey(res.node.name)
+                  );
+
+                  if (finalIdx > -1) {
+                      this.nodes[finalIdx] = res.node;
+                  } else {
+                      this.nodes.push(res.node);
+                  }
+
+                  this.renderNodesGrid();
+              }
+          }).catch(err => {
+              if (!this.isNodeMutationCurrent(mutationNames, mutationId)) return;
+              return this.rollbackNodesState('后台同步到 KV 数据库失败: ' + err.message);
+          }).finally(() => {
+              if (submitBtn) {
+                  submitBtn.disabled = false;
+                  submitBtn.innerHTML = originalBtnText;
+              }
+          });
+      },
+      
+      async deleteNode(name) {
+          const normalizedName = this.normalizeNodeKey(name);
+          const mutationId = this.markNodeMutation([name]);
+          this.nodes = this.nodes.filter(n => String(n?.name || '').trim().toLowerCase() !== normalizedName);
+          this.renderNodesGrid();
+
+          try {
+              await this.apiCall('delete', {name});
+          } catch(err) {
+              if (!this.isNodeMutationCurrent([name], mutationId)) return;
+              await this.rollbackNodesState('后台删除节点失败: ' + err.message);
+          }
+      },
+      
+      formatRelativeTime(ts) {
+          const diff = Math.floor((Date.now() - ts) / 60000);
+          if (diff <= 0) return '刚刚';
+          if (diff < 60) return diff + ' 分钟前';
+          if (diff < 1440) return Math.floor(diff / 60) + ' 小时前';
+          return Math.floor(diff / 1440) + ' 天前';
+      },
+
+      formatUtc8ExactTime(ts) {
+          const time = Number(ts);
+          if (!time) return '-';
+          const date = new Date(time + 8 * 3600 * 1000);
+          if (Number.isNaN(date.getTime())) return '-';
+          const yyyy = date.getUTCFullYear();
+          const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+          const dd = String(date.getUTCDate()).padStart(2, '0');
+          const hh = String(date.getUTCHours()).padStart(2, '0');
+          const mi = String(date.getUTCMinutes()).padStart(2, '0');
+          return 'UTC+8 ' + yyyy + '-' + mm + '-' + dd + ' ' + hh + ':' + mi;
+      },
+      
+      updateTimeCones() {
+          document.querySelectorAll('.log-time-cell').forEach(cell => {
+              const ts = parseInt(cell.dataset.timestamp);
+              if (ts) {
+                cell.textContent = this.formatRelativeTime(ts);
+                const exactTime = this.formatUtc8ExactTime(ts);
+                cell.title = exactTime;
+                cell.setAttribute('aria-label', exactTime);
+              }
+          });
+      },
+
+      formatResourceCategory(path, category) {
+          const p = String(path || "").toLowerCase();
+          if (category === 'error') return '<span class="text-red-500 bg-red-50 dark:bg-red-500/10 px-2 py-1.5 rounded-lg font-medium">请求报错</span>';
+          if (category === 'segment' || p.includes('.ts') || p.includes('.m4s')) return '<span class="text-blue-600 bg-blue-50 dark:text-blue-400 dark:bg-blue-500/10 px-2 py-1.5 rounded-lg font-medium">视频流分片</span>';
+          if (category === 'manifest' || p.includes('.m3u8') || p.includes('.mpd')) return '<span class="text-purple-600 bg-purple-50 dark:text-purple-400 dark:bg-purple-500/10 px-2 py-1.5 rounded-lg font-medium">播放列表</span>';
+          if (category === 'stream' || p.includes('.mp4') || p.includes('.mkv') || p.includes('/stream') || p.includes('download=true')) return '<span class="text-emerald-600 bg-emerald-50 dark:text-emerald-400 dark:bg-emerald-500/10 px-2 py-1.5 rounded-lg font-medium">视频数据</span>';
+          if (category === 'image' || p.includes('/images/') || p.includes('/emby/covers/') || p.includes('.jpg') || p.includes('.png')) return '<span class="text-amber-600 bg-amber-50 dark:text-amber-400 dark:bg-amber-500/10 px-2 py-1.5 rounded-lg font-medium">图片海报</span>';
+          if (category === 'subtitle' || p.includes('.srt') || p.includes('.vtt') || p.includes('.ass')) return '<span class="text-indigo-600 bg-indigo-50 dark:text-indigo-400 dark:bg-indigo-500/10 px-2 py-1.5 rounded-lg font-medium">字幕文件</span>';
+          if (category === 'prewarm') return '<span class="text-cyan-600 bg-cyan-50 dark:text-cyan-400 dark:bg-cyan-500/10 px-2 py-1.5 rounded-lg font-medium">连接预热</span>';
+          if (category === 'websocket' || p.includes('websocket')) return '<span class="text-rose-600 bg-rose-50 dark:text-rose-400 dark:bg-rose-500/10 px-2 py-1.5 rounded-lg font-medium">长连接通讯</span>';
+          
+          if (p.includes('/sessions/playing')) return '<span class="text-slate-600 bg-slate-100 dark:text-slate-300 dark:bg-slate-800 px-2 py-1.5 rounded-lg font-medium">播放状态同步</span>';
+          if (p.includes('/playbackinfo')) return '<span class="text-slate-600 bg-slate-100 dark:text-slate-300 dark:bg-slate-800 px-2 py-1.5 rounded-lg font-medium">播放信息获取</span>';
+          if (p.includes('/users/authenticate')) return '<span class="text-pink-600 bg-pink-50 dark:text-pink-400 dark:bg-pink-500/10 px-2 py-1.5 rounded-lg font-medium">用户认证</span>';
+          if (p.includes('/items/') || p.includes('/shows/') || p.includes('/movies/') || p.includes('/users/')) return '<span class="text-slate-600 bg-slate-100 dark:text-slate-300 dark:bg-slate-800 px-2 py-1.5 rounded-lg font-medium">媒体元数据</span>';
+          
+          return '<span class="text-slate-500 bg-slate-50 dark:text-slate-400 dark:bg-slate-800/50 px-2 py-1.5 rounded-lg font-medium">常规 API</span>';
+      },
+
+      async loadLogs(page = this.logPage) {
+          const keyword = document.getElementById('log-search-input')?.value || '';
+          const res = await this.apiCall('getLogs', {page: page, pageSize: 50, filters: { keyword }});
+          if (res.logs) {
+              this.logPage = res.page;
+              this.logTotalPages = res.totalPages || 1;
+              document.getElementById('log-page-info').textContent = this.logPage + ' / ' + this.logTotalPages;
+
+              const tbody = document.getElementById('logs-tbody');
+              tbody.innerHTML = '';
+              if (!res.logs.length) {
+                  const row = document.createElement('tr');
+                  const cell = document.createElement('td');
+                  cell.colSpan = 6;
+                  cell.className = 'py-6 text-center text-slate-500';
+                  cell.textContent = '暂无匹配日志记录';
+                  row.appendChild(cell);
+                  tbody.appendChild(row);
+                  return;
+              }
+
+              res.logs.forEach(l => {
+                  const row = document.createElement('tr');
+                  row.className = 'border-b border-slate-100 dark:border-slate-800/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition';
+
+                  const nodeCell = document.createElement('td');
+                  nodeCell.className = 'py-3 px-4 font-medium truncate';
+                  nodeCell.title = l.node_name;
+                  nodeCell.textContent = l.node_name;
+
+                  const pathCell = document.createElement('td');
+                  pathCell.className = 'py-3 px-4 text-xs cursor-pointer truncate';
+                  pathCell.title = l.request_path;
+                  pathCell.innerHTML = this.formatResourceCategory(l.request_path, l.category);
+
+                  const statusCell = document.createElement('td');
+                  statusCell.className = 'py-3 px-4 font-bold truncate ' + (l.status_code >= 400 ? 'text-red-500' : 'text-emerald-500');
+                  
+                  // [UI优化] 4xx/5xx 悬停查看错误详情与头信息
+                  if (l.status_code >= 400) {
+                      const errMap = {
+                          400: 'Bad Request (请求无效或参数错误)',
+                          401: 'Unauthorized (未授权，客户端登录失败或缺少凭证)',
+                          403: 'Forbidden (拒绝访问：命中防火墙、IP黑名单或源站拒绝)',
+                          404: 'Not Found (目标不存在：节点未找到或上游路径错误)',
+                          405: 'Method Not Allowed (不允许的请求方法)',
+                          429: 'Too Many Requests (限流拦截：单 IP 请求过频)',
+                          500: 'Internal Server Error (源站或代理内部执行报错)',
+                          502: 'Bad Gateway (网关错误：源站宕机、地址无效或无法连通)',
+                          503: 'Service Unavailable (服务不可用：源站超载或维护)',
+                          504: 'Gateway Timeout (网关超时：目标源站无响应)',
+                          522: 'Connection Timed Out (CF 无法与您的源站建立 TCP 连接)'
+                      };
+                      let hint = errMap[l.status_code] || ('HTTP 异常码: ' + l.status_code);
+                      if (l.error_detail) hint += '&#10;[抓取详情] ' + l.error_detail; 
+                      
+                      // 使用单引号拼接，防止破坏 UI_HTML 外层反引号
+                      statusCell.innerHTML = '<span class="cursor-help border-b border-dashed border-red-400/70 pb-[1px]" title="' + hint.replace(/"/g, '&quot;') + '">' + l.status_code + '</span>';
+                  } else {
+                      statusCell.textContent = String(l.status_code);
+                  }
+
+                  const ipCell = document.createElement('td');
+                  ipCell.className = 'py-3 px-4 font-mono text-xs truncate';
+                  ipCell.title = l.client_ip;
+                  ipCell.textContent = l.client_ip;
+
+                  const uaCell = document.createElement('td');
+                  uaCell.className = 'py-3 px-4 text-xs text-slate-400 truncate';
+                  uaCell.title = l.user_agent || '-';
+                  uaCell.textContent = l.user_agent || '-';
+                  
+                  // Time Cone Cell
+                  const timeCell = document.createElement('td');
+                  timeCell.className = 'py-3 px-4 text-xs font-mono text-slate-500 truncate log-time-cell';
+                  timeCell.dataset.timestamp = l.timestamp;
+                  timeCell.textContent = this.formatRelativeTime(l.timestamp);
+                  const exactTime = this.formatUtc8ExactTime(l.timestamp);
+                  timeCell.title = exactTime;
+                  timeCell.setAttribute('aria-label', exactTime);
+                  timeCell.tabIndex = 0;
+
+                  row.appendChild(nodeCell);
+                  row.appendChild(pathCell);
+                  row.appendChild(statusCell);
+                  row.appendChild(ipCell);
+                  row.appendChild(uaCell);
+                  row.appendChild(timeCell);
+                  tbody.appendChild(row);
+              });
+          }
+      },
+
+      changeLogPage(delta) {
+          const newPage = this.logPage + delta;
+          if(newPage >= 1 && newPage <= this.logTotalPages) {
+              this.loadLogs(newPage);
+          }
+      },
+
+      downloadJson(data, filename) {
+          const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          a.click();
+          URL.revokeObjectURL(url);
+      },
+
+      async exportNodes() {
+          this.downloadJson(this.nodes, \`emby_nodes_\${new Date().getTime()}.json\`);
+      },
+
+      async importNodes(event) {
+          const file = event.target.files[0];
+          if(!file) return;
+          const reader = new FileReader();
+          reader.onload = async (e) => {
+              try {
+                  const data = JSON.parse(e.target.result);
+                  const nodes = Array.isArray(data) ? data : (data.nodes || []);
+                  if(!nodes.length) return alert('未找到有效的节点数据');
+                  await this.apiCall('import', {nodes});
+                  alert('节点导入成功');
+                  this.loadNodes();
+              } catch(err) { alert('文件解析失败'); }
+          };
+          reader.readAsText(file);
+          event.target.value = '';
+      },
+
+      async exportFull() {
+          const res = await this.apiCall('exportConfig');
+          if(res) this.downloadJson(res, \`emby_proxy_full_backup_\${new Date().getTime()}.json\`);
+      },
+
+      async importFull(event) {
+          const file = event.target.files[0];
+          if(!file) return;
+          const reader = new FileReader();
+          reader.onload = async (e) => {
+              try {
+                  const data = JSON.parse(e.target.result);
+                  if(!data.config && !data.nodes) return alert('无效的备份文件');
+                  await this.apiCall('importFull', {config: data.config, nodes: data.nodes});
+                  alert('完整数据导入成功，请刷新页面');
+                  location.reload();
+              } catch(err) { alert('文件解析失败'); }
+          };
+          reader.readAsText(file);
+          event.target.value = '';
+      }
+    };
+    
+    document.addEventListener('DOMContentLoaded', async () => {
+        try {
+            await App.apiCall('loadConfig');
+        } catch (e) {
+            const message = e?.message || '未知错误';
+            if (message !== 'LOGIN_CANCELLED') alert('身份验证失败或网络异常: ' + message);
+            return;
         }
         
-        return new Response("Node Not Found", { status: 404 });
+        try {
+            App.init();
+        } catch (e) {
+            console.error("UI 初始化错误:", e);
+        }
+    });
+  </script>
+</body>
+</html>`;
+
+// ============================================================================
+// 6. 运行时入口 (RUNTIME ENTRYPOINTS)
+// 说明：
+// - `fetch` 负责 UI / API / 代理主入口分发。
+// - `scheduled` 负责日志清理与日报等定时任务。
+// ============================================================================
+function renderLandingPage() {
+  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy V18.0</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 flex items-center justify-center min-h-screen text-center"><div class="p-8 max-w-md w-full bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl"><div class="w-16 h-16 mx-auto bg-brand-500/20 rounded-2xl flex items-center justify-center text-blue-500 mb-6"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></div><h1 class="text-3xl font-bold text-white mb-2">Emby Proxy V18.0</h1><p class="text-slate-400 mb-8">高性能媒体代理与分流中心</p><a href="/admin" class="block w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition">进入管理控制台</a></div></body></html>`;
+  const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' });
+  applySecurityHeaders(headers);
+  headers.set('X-Frame-Options', 'DENY');
+  return new Response(html, { headers });
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const dynamicCors = getCorsHeadersForResponse(env, request);
+    const requestUrl = new URL(request.url);
+    let segments;
+    try { segments = requestUrl.pathname.split('/').filter(Boolean); }
+    catch {
+      const headers = new Headers(dynamicCors);
+      applySecurityHeaders(headers);
+      return new Response('Bad Request', { status: 400, headers });
     }
+
+    const rootRaw = segments[0] || '';
+    const root = safeDecodeSegment(rootRaw).toLowerCase();
+
+    if (request.method === 'GET' && requestUrl.pathname === '/') return renderLandingPage();
+
+    if (root === 'admin' && request.method === 'GET' && requestUrl.pathname.toLowerCase() === '/admin') {
+      const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' });
+      applySecurityHeaders(headers);
+      return new Response(UI_HTML, { headers });
+    }
+
+    if (request.method === 'OPTIONS' && (requestUrl.pathname.toLowerCase().startsWith('/admin') || requestUrl.pathname.toLowerCase().startsWith('/api'))) {
+      const headers = new Headers(dynamicCors);
+      applySecurityHeaders(headers);
+      if (headers.get('Access-Control-Allow-Origin') !== '*') mergeVaryHeader(headers, 'Origin');
+      return new Response(null, { headers });
+    }
+
+    if (root === 'api' && segments[1] === 'auth' && segments[2] === 'login' && request.method === 'POST') return Auth.handleLogin(request, env);
+
+    if (root === 'admin' && request.method === 'POST') {
+      if (!(await Auth.verifyRequest(request, env))) return jsonError('UNAUTHORIZED', '未授权', 401);
+      try {
+        return await normalizeJsonApiResponse(await Database.handleApi(request, env, ctx));
+      } catch (e) {
+        return jsonError('INTERNAL_ERROR', 'Server Error', 500, { reason: e?.message || 'unknown_error' });
+      }
+    }
+
+    if (root) {
+      const nodeData = await Database.getNode(root, env, ctx);
+      if (nodeData) {
+        const secret = nodeData.secret;
+        let valid = true;
+        let prefixLen = 0;
+
+        if (secret) {
+          const secretRaw = segments[1] || '';
+          if (safeDecodeSegment(secretRaw) === secret) prefixLen = 1 + rootRaw.length + 1 + secretRaw.length;
+          else valid = false;
+        } else {
+          prefixLen = 1 + rootRaw.length;
+        }
+
+        if (valid) {
+          let remaining = requestUrl.pathname.substring(prefixLen);
+          if (remaining === '' && !requestUrl.pathname.endsWith('/')) {
+            const redirectUrl = new URL(request.url);
+            redirectUrl.pathname = redirectUrl.pathname + '/';
+            const headers = new Headers({ 'Location': redirectUrl.toString(), 'Cache-Control': 'no-store' });
+            applySecurityHeaders(headers);
+            return new Response(null, { status: 301, headers });
+          }
+          if (remaining === '') remaining = '/';
+          remaining = sanitizeProxyPath(remaining);
+          return Proxy.handle(request, nodeData, remaining, root, secret, env, ctx, { requestUrl, corsHeaders: dynamicCors });
+        }
+      }
+    }
+
+    const headers = new Headers(dynamicCors);
+    applySecurityHeaders(headers);
+    if (headers.get('Access-Control-Allow-Origin') !== '*') mergeVaryHeader(headers, 'Origin');
+    return new Response('Not Found', { status: 404, headers });
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil((async () => {
+      const db = Database.getDB(env);
+      const kv = Database.getKV(env);
+      if (!kv) return;
+
+      const startedAt = new Date().toISOString();
+      await Database.patchOpsStatus(kv, {
+        scheduled: {
+          status: "running",
+          lastStartedAt: startedAt
+        }
+      }).catch(() => {});
+
+      const scheduledState = {
+        status: "success",
+        lastStartedAt: startedAt,
+        lastFinishedAt: null,
+        lastSuccessAt: null,
+        lastErrorAt: null,
+        lastError: null,
+        cleanup: {},
+        report: {}
+      };
+
+      try {
+        const config = await kv.get(Database.CONFIG_KEY, { type: "json" }) || {};
+        
+        if (db) {
+          try {
+            const retentionDays = config.logRetentionDays || 7; 
+            const expireTime = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
+            await db.prepare("DELETE FROM proxy_logs WHERE timestamp < ?").bind(expireTime).run();
+            scheduledState.cleanup = {
+              status: "success",
+              lastSuccessAt: new Date().toISOString(),
+              retentionDays: Number(retentionDays) || 7
+            };
+          } catch (dbErr) {
+            scheduledState.status = "partial_failure";
+            scheduledState.cleanup = {
+              status: "failed",
+              lastErrorAt: new Date().toISOString(),
+              lastError: dbErr?.message || String(dbErr)
+            };
+            console.error("Scheduled DB Cleanup Error: ", dbErr);
+          }
+        } else {
+          scheduledState.cleanup = {
+            status: "skipped",
+            lastSkippedAt: new Date().toISOString(),
+            reason: "db_not_configured"
+          };
+        }
+        
+        const { tgBotToken, tgChatId } = config;
+        if (tgBotToken && tgChatId) {
+            try {
+              await Database.sendDailyTelegramReport(env);
+              scheduledState.report = {
+                status: "success",
+                lastSuccessAt: new Date().toISOString()
+              };
+            } catch (reportErr) {
+              scheduledState.status = scheduledState.status === "success" ? "partial_failure" : scheduledState.status;
+              scheduledState.report = {
+                status: "failed",
+                lastErrorAt: new Date().toISOString(),
+                lastError: reportErr?.message || String(reportErr)
+              };
+              console.error("Scheduled Daily Report Error: ", reportErr);
+            }
+        } else {
+          scheduledState.report = {
+            status: "skipped",
+            lastSkippedAt: new Date().toISOString(),
+            reason: "telegram_not_configured"
+          };
+        }
+      } catch (err) {
+          scheduledState.status = "failed";
+          scheduledState.lastErrorAt = new Date().toISOString();
+          scheduledState.lastError = err?.message || String(err);
+          console.error("Scheduled Task Error: ", err);
+      } finally {
+          const finishedAt = new Date().toISOString();
+          scheduledState.lastFinishedAt = finishedAt;
+          if (scheduledState.status === "success") scheduledState.lastSuccessAt = finishedAt;
+          await Database.patchOpsStatus(kv, { scheduled: scheduledState }).catch(() => {});
+      }
+    })());
+  }
 };
